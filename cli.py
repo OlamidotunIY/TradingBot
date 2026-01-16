@@ -58,18 +58,22 @@ Examples:
     trade_parser = subparsers.add_parser('trade', help='Start live or paper trading')
     trade_parser.add_argument('--mode', '-m', choices=['demo', 'real'], default='demo',
                               help='Trading mode (demo or real account)')
+    trade_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+                              help='Trading symbols (space-separated)')
     trade_parser.add_argument('--config', '-c', default='config/config.yaml', help='Config file')
 
     # Train ML model command
     train_parser = subparsers.add_parser('train', help='Train ML model')
-    train_parser.add_argument('--symbol', default='GBPUSD', help='Trading symbol')
+    train_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+                              help='Trading symbols (space-separated)')
     train_parser.add_argument('--years', '-y', type=int, default=5, help='Years of data')
     train_parser.add_argument('--lookahead', type=int, default=48, help='Lookahead bars')
     train_parser.add_argument('--threshold', type=int, default=40, help='Pip threshold')
 
     # ML Backtest command
     ml_backtest_parser = subparsers.add_parser('ml-backtest', help='Backtest ML model')
-    ml_backtest_parser.add_argument('--symbol', default='GBPUSD', help='Trading symbol')
+    ml_backtest_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+                                    help='Trading symbols (space-separated)')
     ml_backtest_parser.add_argument('--years', '-y', type=int, default=2, help='Years to backtest')
     ml_backtest_parser.add_argument('--balance', type=float, default=100, help='Initial balance')
     ml_backtest_parser.add_argument('--deposit', type=float, default=100, help='Monthly deposit')
@@ -274,15 +278,18 @@ def cmd_backtest_pairs(args):
 
 
 def cmd_trade(args):
-    """Start live/paper trading with ML model."""
+    """Start live/paper trading with ML model for multiple symbols."""
     import os
     from datetime import datetime
     import time
 
     mode = args.mode
+    symbols = args.symbols
+
     print(f"=" * 60)
     print(f"ML TRADING BOT - {mode.upper()} MODE")
     print(f"=" * 60)
+    print(f"Symbols: {', '.join(symbols)}")
 
     # Load environment based on mode
     from dotenv import load_dotenv
@@ -299,11 +306,9 @@ def cmd_trade(args):
 
     if not all([login, password, server]):
         print(f"✗ Missing credentials for {mode} mode")
-        print(f"  Set MT5_{mode.upper()}_LOGIN, MT5_{mode.upper()}_PASSWORD, MT5_{mode.upper()}_SERVER in .env")
         return
 
     print(f"Server: {server}")
-    print(f"Mode: {mode}")
 
     # Connect to MongoDB
     from src.data import Database
@@ -323,18 +328,23 @@ def cmd_trade(args):
     print(f"✓ MT5 connected - Account: {account.login}")
     print(f"  Balance: ${account.balance:,.2f}")
 
-    # Load ML model
+    # Load ML models for each symbol
     from src.ml.ensemble_trainer import EnsembleTrainer
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.data_collector import DataCollector
 
-    symbol = 'GBPUSD'
-    ensemble = EnsembleTrainer()
-    try:
-        ensemble.load_model(f'trading_model_{symbol}_H1')
-        print(f"✓ ML model loaded")
-    except:
-        print("✗ Model not found. Run: trading-bot train")
+    models = {}
+    for symbol in symbols:
+        ensemble = EnsembleTrainer()
+        try:
+            ensemble.load_model(f'trading_model_{symbol}_H1')
+            models[symbol] = ensemble
+            print(f"✓ Model loaded: {symbol}")
+        except:
+            print(f"✗ Model not found for {symbol}")
+
+    if not models:
+        print("✗ No models loaded. Run: python cli.py train")
         mt5.shutdown()
         return
 
@@ -344,10 +354,8 @@ def cmd_trade(args):
     RISK_PER_TRADE = 0.02
     MAX_LOT_SIZE = 0.1 if mode == 'demo' else 1.0
     MIN_CONFIDENCE = 0.75
-    HOLD_BARS = 48
 
     print(f"\nTrading Settings:")
-    print(f"  Symbol: {symbol}")
     print(f"  Risk: {RISK_PER_TRADE*100}%")
     print(f"  Max Lot: {MAX_LOT_SIZE}")
     print(f"  Min Confidence: {MIN_CONFIDENCE}")
@@ -356,93 +364,93 @@ def cmd_trade(args):
     print("STARTING TRADING LOOP (Ctrl+C to stop)")
     print(f"{'='*60}\n")
 
-    collector = DataCollector([symbol])
+    collector = DataCollector(list(models.keys()))
     collector.connect()
 
     try:
         while True:
             now = datetime.now()
-            print(f"[{now.strftime('%H:%M:%S')}] Checking signals...")
+            print(f"\n[{now.strftime('%H:%M:%S')}] Checking signals...")
 
-            # Get data
-            df_h1 = collector.get_historical_data(symbol, 'H1', 300)
-            df_h4 = collector.get_historical_data(symbol, 'H4', 100)
-            df_d1 = collector.get_historical_data(symbol, 'D1', 50)
+            for symbol, ensemble in models.items():
+                # Get data
+                df_h1 = collector.get_historical_data(symbol, 'H1', 300)
+                df_h4 = collector.get_historical_data(symbol, 'H4', 100)
+                df_d1 = collector.get_historical_data(symbol, 'D1', 50)
 
-            if df_h1.empty:
-                time.sleep(60)
-                continue
+                if df_h1.empty:
+                    continue
 
-            # Create features and predict
-            features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
-            X = features_df[engineer.get_feature_names()].tail(1).values
-            predictions, avg_proba, unanimous = ensemble.predict(X)
+                # Create features and predict
+                features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
+                X = features_df[engineer.get_feature_names()].tail(1).values
+                predictions, avg_proba, unanimous = ensemble.predict(X)
 
-            pred = predictions[0]
-            proba = avg_proba[0]
-            is_unanimous = unanimous[0]
-            is_high_conf = proba > MIN_CONFIDENCE or proba < (1 - MIN_CONFIDENCE)
+                pred = predictions[0]
+                proba = avg_proba[0]
+                is_unanimous = unanimous[0]
+                is_high_conf = proba > MIN_CONFIDENCE or proba < (1 - MIN_CONFIDENCE)
 
-            if is_unanimous and is_high_conf:
-                signal_type = 'BUY' if pred == 1 else 'SELL'
-                confidence = proba if pred == 1 else 1 - proba
+                if is_unanimous and is_high_conf:
+                    signal_type = 'BUY' if pred == 1 else 'SELL'
+                    confidence = proba if pred == 1 else 1 - proba
 
-                print(f"  🔔 SIGNAL: {signal_type} | Confidence: {confidence:.2%}")
+                    print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%}")
 
-                # Save signal to MongoDB
-                signal_doc = {
-                    'symbol': symbol,
-                    'signal_type': signal_type,
-                    'confidence': confidence,
-                    'price': df_h1['close'].iloc[-1],
-                    'mode': mode,
-                    'strategy': 'ensemble_ml'
-                }
-                db.save_signal(signal_doc)
-
-                # Calculate lot size
-                balance = mt5.account_info().balance
-                lot_size = min((balance * RISK_PER_TRADE) / (40 * 10), MAX_LOT_SIZE)
-                lot_size = max(0.01, round(lot_size, 2))
-
-                # Execute trade
-                order_type = mt5.ORDER_TYPE_BUY if signal_type == 'BUY' else mt5.ORDER_TYPE_SELL
-                price = mt5.symbol_info_tick(symbol).ask if signal_type == 'BUY' else mt5.symbol_info_tick(symbol).bid
-
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": lot_size,
-                    "type": order_type,
-                    "price": price,
-                    "deviation": 10,
-                    "magic": 123456,
-                    "comment": f"ML {signal_type}",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-
-                result = mt5.order_send(request)
-                if result.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"  ✓ Trade executed: {result.order}")
-
-                    # Save trade to MongoDB
-                    trade_doc = {
-                        'ticket': result.order,
+                    # Save signal to MongoDB
+                    db.save_signal({
                         'symbol': symbol,
-                        'type': signal_type,
-                        'volume': lot_size,
-                        'entry_price': price,
-                        'mode': mode,
-                        'strategy': 'ensemble_ml',
+                        'signal_type': signal_type,
                         'confidence': confidence,
-                        'entry_time': datetime.utcnow()
+                        'price': df_h1['close'].iloc[-1],
+                        'mode': mode,
+                        'strategy': 'ensemble_ml'
+                    })
+
+                    # Calculate lot size
+                    balance = mt5.account_info().balance
+                    lot_size = min((balance * RISK_PER_TRADE) / (40 * 10), MAX_LOT_SIZE)
+                    lot_size = max(0.01, round(lot_size, 2))
+
+                    # Execute trade
+                    order_type = mt5.ORDER_TYPE_BUY if signal_type == 'BUY' else mt5.ORDER_TYPE_SELL
+                    tick = mt5.symbol_info_tick(symbol)
+                    if tick is None:
+                        continue
+                    price = tick.ask if signal_type == 'BUY' else tick.bid
+
+                    request = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": symbol,
+                        "volume": lot_size,
+                        "type": order_type,
+                        "price": price,
+                        "deviation": 10,
+                        "magic": 123456,
+                        "comment": f"ML {signal_type}",
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_IOC,
                     }
-                    db.save_trade(trade_doc)
+
+                    result = mt5.order_send(request)
+                    if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        print(f"     ✓ Trade executed: {result.order}")
+
+                        db.save_trade({
+                            'ticket': result.order,
+                            'symbol': symbol,
+                            'type': signal_type,
+                            'volume': lot_size,
+                            'entry_price': price,
+                            'mode': mode,
+                            'strategy': 'ensemble_ml',
+                            'confidence': confidence,
+                            'entry_time': datetime.utcnow()
+                        })
+                    else:
+                        print(f"     ✗ Trade failed: {result.comment}")
                 else:
-                    print(f"  ✗ Trade failed: {result.comment}")
-            else:
-                print(f"  No signal (conf={proba:.2%}, unanimous={is_unanimous})")
+                    print(f"  {symbol}: No signal (conf={proba:.2%})")
 
             time.sleep(60)
 
@@ -455,160 +463,186 @@ def cmd_trade(args):
 
 
 def cmd_train(args):
-    """Train ML model."""
+    """Train ML model for multiple symbols."""
     print(f"=" * 60)
-    print("TRAINING ML MODEL")
+    print("TRAINING ML MODELS")
     print(f"=" * 60)
 
     from src.ml.data_collector import DataCollector
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.ensemble_trainer import EnsembleTrainer
 
-    symbol = args.symbol
+    symbols = args.symbols
     years = args.years
     lookahead = args.lookahead
     threshold = args.threshold
 
-    print(f"Symbol: {symbol}")
+    print(f"Symbols: {', '.join(symbols)}")
     print(f"Years: {years}")
     print(f"Lookahead: {lookahead} bars")
     print(f"Threshold: {threshold} pips")
 
-    # Collect data
-    collector = DataCollector([symbol])
+    collector = DataCollector(symbols)
     if not collector.connect():
         print("✗ MT5 connection failed")
         return
 
     try:
-        df_h1, labels = collector.prepare_training_data(
-            symbol, 'H1', years, lookahead, threshold, binary_only=True
-        )
-        df_h4 = collector.get_historical_data(symbol, 'H4', 10000)
-        df_d1 = collector.get_historical_data(symbol, 'D1', 2000)
+        for symbol in symbols:
+            print(f"\n{'='*50}")
+            print(f"Training {symbol}...")
+            print(f"{'='*50}")
+
+            df_h1, labels = collector.prepare_training_data(
+                symbol, 'H1', years, lookahead, threshold, binary_only=True
+            )
+            df_h4 = collector.get_historical_data(symbol, 'H4', 10000)
+            df_d1 = collector.get_historical_data(symbol, 'D1', 2000)
+
+            engineer = AdvancedFeatureEngineer()
+            features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
+            labels = labels.loc[features_df.index]
+
+            feature_cols = [c for c in features_df.columns
+                            if c not in ['open', 'high', 'low', 'close', 'volume', 'spread', 'real_volume']
+                            and features_df[c].dtype in ['float64', 'int64', 'float32', 'int32']]
+
+            X = features_df[feature_cols].values
+            y = labels.values
+
+            print(f"Features: {len(feature_cols)}, Samples: {len(X)}")
+
+            ensemble = EnsembleTrainer()
+            metrics = ensemble.train_ensemble(X, y, feature_cols, top_features=60)
+            ensemble.save_model(f'trading_model_{symbol}_H1')
+
+            print(f"✓ Model saved: trading_model_{symbol}_H1")
+            print(f"  Accuracy: {metrics.get('accuracy_best', 0):.2%}")
     finally:
         collector.disconnect()
 
-    # Feature engineering
-    engineer = AdvancedFeatureEngineer()
-    features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
-    labels = labels.loc[features_df.index]
-
-    feature_cols = [c for c in features_df.columns
-                    if c not in ['open', 'high', 'low', 'close', 'volume', 'spread', 'real_volume']
-                    and features_df[c].dtype in ['float64', 'int64', 'float32', 'int32']]
-
-    X = features_df[feature_cols].values
-    y = labels.values
-
-    print(f"\nFeatures: {len(feature_cols)}")
-    print(f"Samples: {len(X)}")
-
-    # Train ensemble
-    ensemble = EnsembleTrainer()
-    metrics = ensemble.train_ensemble(X, y, feature_cols, top_features=60)
-    ensemble.save_model(f'trading_model_{symbol}_H1')
-
-    print(f"\n✓ Model saved: trading_model_{symbol}_H1")
-    print(f"  Best accuracy: {metrics.get('accuracy_best', 0):.2%}")
+    print(f"\n{'='*60}")
+    print(f"✓ All {len(symbols)} models trained!")
 
 
 def cmd_ml_backtest(args):
-    """Run ML backtest."""
+    """Run ML backtest for multiple symbols."""
     print(f"=" * 60)
-    print("ML BACKTEST")
+    print("ML BACKTEST (Multi-Symbol)")
     print(f"=" * 60)
 
     from src.ml.data_collector import DataCollector
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.ensemble_trainer import EnsembleTrainer
-    import pandas as pd
 
-    symbol = args.symbol
+    symbols = args.symbols
     years = args.years
     initial_balance = args.balance
     monthly_deposit = args.deposit
 
-    print(f"Symbol: {symbol}")
+    print(f"Symbols: {', '.join(symbols)}")
     print(f"Years: {years}")
     print(f"Initial: ${initial_balance}")
     print(f"Monthly deposit: ${monthly_deposit}")
 
-    # Load data
-    collector = DataCollector([symbol])
+    collector = DataCollector(symbols)
     if not collector.connect():
         print("✗ MT5 connection failed")
         return
 
+    all_results = []
+
     try:
-        bars = years * 8760
-        df_h1 = collector.get_historical_data(symbol, 'H1', bars)
-        df_h4 = collector.get_historical_data(symbol, 'H4', bars // 4)
-        df_d1 = collector.get_historical_data(symbol, 'D1', bars // 24)
+        for symbol in symbols:
+            print(f"\n{'='*50}")
+            print(f"Backtesting {symbol}...")
+            print(f"{'='*50}")
+
+            bars = years * 8760
+            df_h1 = collector.get_historical_data(symbol, 'H1', bars)
+            df_h4 = collector.get_historical_data(symbol, 'H4', bars // 4)
+            df_d1 = collector.get_historical_data(symbol, 'D1', bars // 24)
+
+            ensemble = EnsembleTrainer()
+            try:
+                ensemble.load_model(f'trading_model_{symbol}_H1')
+            except:
+                print(f"  ✗ Model not found for {symbol}. Run: trading-bot train")
+                continue
+
+            engineer = AdvancedFeatureEngineer()
+            features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
+            X = features_df[engineer.get_feature_names()].values
+            predictions, avg_proba, unanimous = ensemble.predict(X)
+
+            high_conf = (avg_proba > 0.75) | (avg_proba < 0.25)
+            best_signals = unanimous & high_conf
+
+            balance = initial_balance
+            total_deposited = initial_balance
+            trades = []
+            current_month = None
+            HOLD_BARS = 48
+
+            i = 0
+            while i < len(features_df) - HOLD_BARS:
+                month = features_df.index[i].to_period('M')
+                if current_month != month:
+                    if current_month is not None:
+                        balance += monthly_deposit
+                        total_deposited += monthly_deposit
+                    current_month = month
+
+                if best_signals[i]:
+                    entry = df_h1.loc[features_df.index[i], 'close']
+                    exit_price = df_h1.loc[features_df.index[i + HOLD_BARS], 'close']
+
+                    pred = predictions[i]
+                    pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
+                    pips -= 3
+
+                    lot = min((balance * 0.02) / (40 * 10), 10.0)
+                    lot = max(0.01, round(lot, 2))
+                    pnl = pips * 10 * lot
+                    balance += pnl
+
+                    trades.append({'pnl': pnl, 'symbol': symbol})
+                    i += HOLD_BARS
+                else:
+                    i += 1
+
+            wins = sum(1 for t in trades if t['pnl'] > 0)
+            win_rate = wins / len(trades) * 100 if trades else 0
+            profit = balance - total_deposited
+
+            print(f"  Balance: ${balance:,.2f} | Profit: ${profit:,.2f}")
+            print(f"  Trades: {len(trades)} | Win rate: {win_rate:.1f}%")
+
+            all_results.append({
+                'symbol': symbol,
+                'balance': balance,
+                'profit': profit,
+                'trades': len(trades),
+                'wins': wins,
+                'deposited': total_deposited
+            })
     finally:
         collector.disconnect()
 
-    # Load model
-    ensemble = EnsembleTrainer()
-    try:
-        ensemble.load_model(f'trading_model_{symbol}_H1')
-    except:
-        print("✗ Model not found. Run: trading-bot train")
-        return
+    # Combined results
+    print(f"\n{'='*60}")
+    print("COMBINED RESULTS")
+    print(f"{'='*60}")
 
-    # Features and predictions
-    engineer = AdvancedFeatureEngineer()
-    features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
-    X = features_df[engineer.get_feature_names()].values
-    predictions, avg_proba, unanimous = ensemble.predict(X)
+    total_profit = sum(r['profit'] for r in all_results)
+    total_trades = sum(r['trades'] for r in all_results)
+    total_wins = sum(r['wins'] for r in all_results)
+    avg_balance = sum(r['balance'] for r in all_results) / len(all_results)
 
-    # Backtest
-    high_conf = (avg_proba > 0.75) | (avg_proba < 0.25)
-    best_signals = unanimous & high_conf
-
-    balance = initial_balance
-    total_deposited = initial_balance
-    trades = []
-    current_month = None
-
-    HOLD_BARS = 48
-    i = 0
-    while i < len(features_df) - HOLD_BARS:
-        month = features_df.index[i].to_period('M')
-        if current_month != month:
-            if current_month is not None:
-                balance += monthly_deposit
-                total_deposited += monthly_deposit
-            current_month = month
-
-        if best_signals[i]:
-            entry = df_h1.loc[features_df.index[i], 'close']
-            exit_price = df_h1.loc[features_df.index[i + HOLD_BARS], 'close']
-
-            pred = predictions[i]
-            pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
-            pips -= 3  # Spread + slippage
-
-            lot = min((balance * 0.02) / (40 * 10), 10.0)
-            lot = max(0.01, round(lot, 2))
-            pnl = pips * 10 * lot
-            balance += pnl
-
-            trades.append({'pnl': pnl, 'balance': balance})
-            i += HOLD_BARS
-        else:
-            i += 1
-
-    # Results
-    wins = sum(1 for t in trades if t['pnl'] > 0)
-    print(f"\n{'='*50}")
-    print(f"RESULTS")
-    print(f"{'='*50}")
-    print(f"Total deposited: ${total_deposited:,.2f}")
-    print(f"Final balance: ${balance:,.2f}")
-    print(f"Net profit: ${balance - total_deposited:,.2f}")
-    print(f"Return: {((balance - total_deposited) / total_deposited) * 100:.1f}%")
-    print(f"Trades: {len(trades)} | Wins: {wins} | Win rate: {wins/len(trades)*100:.1f}%")
+    print(f"Total profit (all symbols): ${total_profit:,.2f}")
+    print(f"Average final balance: ${avg_balance:,.2f}")
+    print(f"Total trades: {total_trades}")
+    print(f"Overall win rate: {total_wins/total_trades*100:.1f}%" if total_trades > 0 else "N/A")
 
 
 def main():
