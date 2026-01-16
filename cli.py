@@ -278,16 +278,17 @@ def cmd_backtest_pairs(args):
 
 
 def cmd_trade(args):
-    """Start live/paper trading with ML model for multiple symbols."""
+    """Start live/paper trading with ML model and advanced strategies."""
     import os
     from datetime import datetime
     import time
+    import numpy as np
 
     mode = args.mode
     symbols = args.symbols
 
     print(f"=" * 60)
-    print(f"ML TRADING BOT - {mode.upper()} MODE")
+    print(f"ADVANCED ML TRADING BOT - {mode.upper()} MODE")
     print(f"=" * 60)
     print(f"Symbols: {', '.join(symbols)}")
 
@@ -333,15 +334,43 @@ def cmd_trade(args):
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.data_collector import DataCollector
 
+    # Load advanced strategy modules
+    from src.ml.regime_detector import RegimeDetector
+    from src.risk.dynamic_sizing import DynamicPositionSizer, calculate_atr
+    from src.risk.trailing_stop import TrailingStopManager, calculate_atr_pips
+    from src.risk.correlation_manager import CorrelationManager
+    from src.filters.session_filter import SessionFilter
+
+    # Initialize advanced modules
+    session_filter = SessionFilter()
+    correlation_mgr = CorrelationManager()
+    position_sizer = DynamicPositionSizer(
+        base_risk_pct=0.02,
+        max_lot_size=0.1 if mode == 'demo' else 1.0
+    )
+    trailing_mgr = TrailingStopManager()
+    regime_detectors = {}  # Per-symbol regime detectors
+
     models = {}
+    exit_models = {}
     for symbol in symbols:
         ensemble = EnsembleTrainer()
         try:
             ensemble.load_model(f'trading_model_{symbol}_H1')
             models[symbol] = ensemble
-            print(f"✓ Model loaded: {symbol}")
+            print(f"✓ Entry model loaded: {symbol}")
         except:
-            print(f"✗ Model not found for {symbol}")
+            print(f"✗ Entry model not found for {symbol}")
+
+        # Load exit model
+        from src.ml.exit_model import ExitModelTrainer
+        exit_trainer = ExitModelTrainer()
+        try:
+            exit_trainer.load_model(f'{symbol}_H1')
+            exit_models[symbol] = exit_trainer
+            print(f"✓ Exit model loaded: {symbol}")
+        except:
+            print(f"  (No exit model for {symbol} - using 48h fallback)")
 
     if not models:
         print("✗ No models loaded. Run: python cli.py train")
@@ -351,15 +380,19 @@ def cmd_trade(args):
     engineer = AdvancedFeatureEngineer()
 
     # Trading parameters
-    RISK_PER_TRADE = 0.02
-    MAX_LOT_SIZE = 0.1 if mode == 'demo' else 1.0
     MIN_CONFIDENCE = 0.75
+    EXIT_CONFIDENCE = 0.6
 
-    print(f"\nTrading Settings:")
-    print(f"  Risk: {RISK_PER_TRADE*100}%")
-    print(f"  Max Lot: {MAX_LOT_SIZE}")
-    print(f"  Min Confidence: {MIN_CONFIDENCE}")
-    print(f"  Hold Period: 48 hours")
+    print(f"\n{'='*60}")
+    print("ADVANCED FEATURES ENABLED:")
+    print(f"{'='*60}")
+    print(f"  ✓ Session Filter (London/NY)")
+    print(f"  ✓ Regime Detection (Trend/Range)")
+    print(f"  ✓ Dynamic Position Sizing (ATR + Kelly)")
+    print(f"  ✓ Trailing Stops (2×ATR)")
+    print(f"  ✓ Correlation Manager")
+    print(f"  ✓ ML Entry Model (conf > {MIN_CONFIDENCE})")
+    print(f"  ✓ ML Exit Model (conf > {EXIT_CONFIDENCE})")
 
     print(f"\n{'='*60}")
     print("STARTING TRADING LOOP (Ctrl+C to stop)")
@@ -368,25 +401,71 @@ def cmd_trade(args):
     collector = DataCollector(list(models.keys()))
     collector.connect()
 
-    HOLD_HOURS = 48  # Close trades after 48 hours
+    MAX_HOLD_HOURS = 48  # Maximum hold as fallback
 
     try:
         while True:
             now = datetime.now()
-            print(f"\n[{now.strftime('%H:%M:%S')}] Checking signals...")
+            print(f"\n[{now.strftime('%H:%M:%S')}] Checking...")
 
-            # First, check if any positions need to be closed (48h hold)
+            # First, check if any positions should be closed using ML exit model
             all_positions = mt5.positions_get()
             if all_positions:
                 for pos in all_positions:
                     if pos.magic == 123456:  # Only our trades
+                        symbol = pos.symbol
                         open_time = datetime.fromtimestamp(pos.time)
                         hours_open = (now - open_time).total_seconds() / 3600
+                        bars_open = int(hours_open)  # H1 bars
 
-                        if hours_open >= HOLD_HOURS:
-                            # Close the position
+                        # Calculate position features
+                        entry_price = pos.price_open
+                        current_price = pos.price_current
+                        if pos.type == 0:  # BUY
+                            unrealized_pips = (current_price - entry_price) * 10000
+                        else:  # SELL
+                            unrealized_pips = (entry_price - current_price) * 10000
+
+                        should_close = False
+                        close_reason = ""
+
+                        # Check ML exit model if available
+                        if symbol in exit_models and symbol in models:
+                            # Get current market features
+                            df_h1 = collector.get_historical_data(symbol, 'H1', 100)
+                            df_h4 = collector.get_historical_data(symbol, 'H4', 50)
+                            df_d1 = collector.get_historical_data(symbol, 'D1', 20)
+
+                            if not df_h1.empty:
+                                features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
+                                market_features = features_df[engineer.get_feature_names()].tail(1).values
+
+                                # Position features
+                                max_profit = max(unrealized_pips, pos.profit * 10)  # Approximate
+                                position_features = np.array([[
+                                    bars_open,
+                                    unrealized_pips,
+                                    max_profit,
+                                    min(0, unrealized_pips),  # max drawdown
+                                    unrealized_pips - max_profit,  # pullback
+                                    bars_open / 48  # normalized time
+                                ]])
+
+                                X_exit = np.hstack([market_features, position_features])
+                                exit_pred, exit_proba = exit_models[symbol].predict(X_exit)
+
+                                if exit_pred[0] == 1 and exit_proba[0] > EXIT_CONFIDENCE:
+                                    should_close = True
+                                    close_reason = f"ML Exit ({exit_proba[0]:.0%})"
+
+                        # Fallback: Force close after max hold hours
+                        if not should_close and hours_open >= MAX_HOLD_HOURS:
+                            should_close = True
+                            close_reason = f"Max hold ({hours_open:.0f}h)"
+
+                        if should_close:
                             tick = mt5.symbol_info_tick(pos.symbol)
-                            close_price = tick.bid if pos.type == 0 else tick.ask  # BUY->bid, SELL->ask
+                            close_price = tick.bid if pos.type == 0 else tick.ask
 
                             close_request = {
                                 "action": mt5.TRADE_ACTION_DEAL,
@@ -397,14 +476,14 @@ def cmd_trade(args):
                                 "price": close_price,
                                 "deviation": 20,
                                 "magic": 123456,
-                                "comment": "ML Close",
+                                "comment": close_reason[:20],
                                 "type_time": mt5.ORDER_TIME_GTC,
                                 "type_filling": mt5.ORDER_FILLING_FOK,
                             }
 
                             result = mt5.order_send(close_request)
                             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                                print(f"  📤 Closed {pos.symbol} (held {hours_open:.1f}h) | P/L: ${pos.profit:.2f}")
+                                print(f"  📤 Closed {symbol} ({close_reason}) | P/L: ${pos.profit:.2f}")
                                 db.update_trade(pos.ticket, {
                                     'status': 'CLOSED',
                                     'exit_price': close_price,
@@ -412,7 +491,7 @@ def cmd_trade(args):
                                     'exit_time': now
                                 })
                             else:
-                                print(f"  ✗ Failed to close {pos.symbol}: {result.comment}")
+                                print(f"  ✗ Failed to close {symbol}: {result.comment}")
 
             for symbol, ensemble in models.items():
                 # Get data
@@ -423,7 +502,13 @@ def cmd_trade(args):
                 if df_h1.empty:
                     continue
 
-                # Create features and predict FIRST
+                # === FILTER 1: Session Filter ===
+                can_trade_session, session_reason = session_filter.should_trade(symbol)
+                if not can_trade_session:
+                    print(f"  {symbol}: ⏰ {session_reason}")
+                    continue
+
+                # Create features and predict
                 features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
                 X = features_df[engineer.get_feature_names()].tail(1).values
                 predictions, avg_proba, unanimous = ensemble.predict(X)
@@ -462,7 +547,8 @@ def cmd_trade(args):
                         result = mt5.order_send(close_request)
                         if result.retcode == mt5.TRADE_RETCODE_DONE:
                             print(f"     ✓ Closed (P/L: ${pos.profit:.2f})")
-                            # Don't continue - allow opening new trade below
+                            trailing_mgr.remove_position(pos.ticket)
+                            correlation_mgr.remove_position(str(pos.ticket))
                         else:
                             print(f"     ✗ Failed: {result.comment}")
                             continue
@@ -474,7 +560,21 @@ def cmd_trade(args):
                     signal_type = new_signal
                     confidence = proba if pred == 1 else 1 - proba
 
-                    print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%}")
+                    # === FILTER 2: Correlation Check ===
+                    can_trade_corr, corr_reason = correlation_mgr.can_open_position(symbol, signal_type)
+                    if not can_trade_corr:
+                        print(f"  {symbol}: 📊 {corr_reason}")
+                        continue
+
+                    # === FILTER 3: Regime Detection (simple heuristic) ===
+                    atr_pips = calculate_atr_pips(df_h1)
+                    volatility = df_h1['close'].pct_change().rolling(20).std().iloc[-1]
+                    is_high_vol = volatility > 0.015
+
+                    if is_high_vol:
+                        print(f"  {symbol}: ⚡ High volatility - reducing size")
+
+                    print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%} | ATR: {atr_pips:.1f} pips")
 
                     # Save signal to MongoDB
                     db.save_signal({
@@ -483,13 +583,22 @@ def cmd_trade(args):
                         'confidence': confidence,
                         'price': df_h1['close'].iloc[-1],
                         'mode': mode,
-                        'strategy': 'ensemble_ml'
+                        'strategy': 'ensemble_ml_advanced'
                     })
 
-                    # Calculate lot size
+                    # === DYNAMIC POSITION SIZING ===
                     balance = mt5.account_info().balance
-                    lot_size = min((balance * RISK_PER_TRADE) / (40 * 10), MAX_LOT_SIZE)
-                    lot_size = max(0.01, round(lot_size, 2))
+                    regime = 'high_volatility' if is_high_vol else 'trending_up' if signal_type == 'BUY' else 'trending_down'
+
+                    sizing = position_sizer.calculate_position_size(
+                        balance=balance,
+                        atr_pips=atr_pips,
+                        confidence=confidence,
+                        regime=regime
+                    )
+                    lot_size = sizing['lot_size']
+
+                    print(f"     Size: {lot_size} lots | Risk: {sizing['risk_pct']*100:.1f}% | Stop: {sizing['stop_pips']:.0f} pips")
 
                     # Execute trade
                     order_type = mt5.ORDER_TYPE_BUY if signal_type == 'BUY' else mt5.ORDER_TYPE_SELL
@@ -524,15 +633,30 @@ def cmd_trade(args):
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
                         print(f"     ✓ Trade executed: {result.order}")
 
+                        # Add to trailing stop manager
+                        trailing_mgr.add_position(
+                            ticket=result.order,
+                            symbol=symbol,
+                            direction=signal_type,
+                            entry_price=price,
+                            atr_pips=atr_pips
+                        )
+
+                        # Add to correlation manager
+                        correlation_mgr.add_position(str(result.order), symbol, signal_type)
+
                         db.save_trade({
                             'ticket': result.order,
                             'symbol': symbol,
                             'type': signal_type,
                             'volume': lot_size,
                             'entry_price': price,
+                            'stop_price': sizing['stop_pips'],
                             'mode': mode,
-                            'strategy': 'ensemble_ml',
+                            'strategy': 'ensemble_ml_advanced',
                             'confidence': confidence,
+                            'regime': regime,
+                            'atr_pips': atr_pips,
                             'entry_time': datetime.now(tz=__import__('datetime').timezone.utc)
                         })
                     else:
@@ -553,12 +677,13 @@ def cmd_trade(args):
 def cmd_train(args):
     """Train ML model for multiple symbols."""
     print(f"=" * 60)
-    print("TRAINING ML MODELS")
+    print("TRAINING ML MODELS (Entry + Exit)")
     print(f"=" * 60)
 
     from src.ml.data_collector import DataCollector
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.ensemble_trainer import EnsembleTrainer
+    from src.ml.exit_model import ExitModelTrainer
 
     symbols = args.symbols
     years = args.years
@@ -600,28 +725,61 @@ def cmd_train(args):
 
             print(f"Features: {len(feature_cols)}, Samples: {len(X)}")
 
+            # Train ENTRY model
+            print("\n--- ENTRY MODEL ---")
             ensemble = EnsembleTrainer()
             metrics = ensemble.train_ensemble(X, y, feature_cols, top_features=60)
             ensemble.save_model(f'trading_model_{symbol}_H1')
+            print(f"✓ Entry model saved: trading_model_{symbol}_H1")
 
-            print(f"✓ Model saved: trading_model_{symbol}_H1")
-            print(f"  Accuracy: {metrics.get('accuracy_best', 0):.2%}")
+            # Train EXIT model
+            print("\n--- EXIT MODEL ---")
+            exit_trainer = ExitModelTrainer()
+
+            # Generate entry signals from trained model
+            predictions, avg_proba, unanimous = ensemble.predict(X)
+            high_conf = (avg_proba > 0.75) | (avg_proba < 0.25)
+            entry_signals = unanimous & high_conf
+
+            # Generate exit labels
+            exit_labels, position_features = exit_trainer.generate_exit_labels(
+                df_h1.loc[features_df.index],
+                entry_signals,
+                predictions,
+                max_hold_bars=48
+            )
+
+            # Combine features
+            position_feature_names = [
+                'bars_in_position', 'unrealized_pips', 'max_profit_seen',
+                'max_drawdown_seen', 'pullback_from_peak', 'normalized_time'
+            ]
+            all_feature_names = feature_cols + position_feature_names
+            X_exit = exit_trainer.create_exit_features(features_df[feature_cols], position_features)
+
+            exit_metrics = exit_trainer.train_exit_model(X_exit, exit_labels, all_feature_names, top_features=40)
+            exit_trainer.save_model(f'{symbol}_H1')
+            print(f"✓ Exit model saved: exit_model_{symbol}_H1")
+
     finally:
         collector.disconnect()
 
     print(f"\n{'='*60}")
-    print(f"✓ All {len(symbols)} models trained!")
+    print(f"✓ All {len(symbols)} entry + exit models trained!")
 
 
 def cmd_ml_backtest(args):
-    """Run ML backtest for multiple symbols."""
+    """Run ML backtest for multiple symbols with exit model comparison."""
+    import numpy as np
+
     print(f"=" * 60)
-    print("ML BACKTEST (Multi-Symbol)")
+    print("ML BACKTEST (Entry + Exit Models)")
     print(f"=" * 60)
 
     from src.ml.data_collector import DataCollector
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.ensemble_trainer import EnsembleTrainer
+    from src.ml.exit_model import ExitModelTrainer
 
     symbols = args.symbols
     years = args.years
@@ -638,7 +796,8 @@ def cmd_ml_backtest(args):
         print("✗ MT5 connection failed")
         return
 
-    all_results = []
+    results_fixed = []  # Fixed 48h hold
+    results_ml_exit = []  # ML exit model
 
     try:
         for symbol in symbols:
@@ -651,86 +810,174 @@ def cmd_ml_backtest(args):
             df_h4 = collector.get_historical_data(symbol, 'H4', bars // 4)
             df_d1 = collector.get_historical_data(symbol, 'D1', bars // 24)
 
+            # Load entry model
             ensemble = EnsembleTrainer()
             try:
                 ensemble.load_model(f'trading_model_{symbol}_H1')
             except:
-                print(f"  ✗ Model not found for {symbol}. Run: trading-bot train")
+                print(f"  ✗ Entry model not found for {symbol}")
                 continue
+
+            # Load exit model
+            exit_trainer = ExitModelTrainer()
+            has_exit_model = False
+            try:
+                exit_trainer.load_model(f'{symbol}_H1')
+                has_exit_model = True
+            except:
+                print(f"  (No exit model - ML exit disabled)")
 
             engineer = AdvancedFeatureEngineer()
             features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
-            X = features_df[engineer.get_feature_names()].values
+            feature_cols = engineer.get_feature_names()
+            X = features_df[feature_cols].values
             predictions, avg_proba, unanimous = ensemble.predict(X)
 
             high_conf = (avg_proba > 0.75) | (avg_proba < 0.25)
             best_signals = unanimous & high_conf
+            close_prices = df_h1.loc[features_df.index, 'close'].values
 
-            balance = initial_balance
-            total_deposited = initial_balance
-            trades = []
+            MAX_HOLD = 48
+
+            # ============ STRATEGY 1: Fixed 48h Hold ============
+            balance_fixed = initial_balance
+            deposited_fixed = initial_balance
+            trades_fixed = []
             current_month = None
-            HOLD_BARS = 48
 
             i = 0
-            while i < len(features_df) - HOLD_BARS:
+            while i < len(features_df) - MAX_HOLD:
                 month = features_df.index[i].to_period('M')
                 if current_month != month:
                     if current_month is not None:
-                        balance += monthly_deposit
-                        total_deposited += monthly_deposit
+                        balance_fixed += monthly_deposit
+                        deposited_fixed += monthly_deposit
                     current_month = month
 
                 if best_signals[i]:
-                    entry = df_h1.loc[features_df.index[i], 'close']
-                    exit_price = df_h1.loc[features_df.index[i + HOLD_BARS], 'close']
-
+                    entry = close_prices[i]
+                    exit_price = close_prices[i + MAX_HOLD]
                     pred = predictions[i]
                     pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
-                    pips -= 3
+                    pips -= 3  # Spread
 
-                    lot = min((balance * 0.02) / (40 * 10), 10.0)
+                    lot = min((balance_fixed * 0.02) / (40 * 10), 10.0)
                     lot = max(0.01, round(lot, 2))
                     pnl = pips * 10 * lot
-                    balance += pnl
-
-                    trades.append({'pnl': pnl, 'symbol': symbol})
-                    i += HOLD_BARS
+                    balance_fixed += pnl
+                    trades_fixed.append({'pnl': pnl, 'hold': MAX_HOLD})
+                    i += MAX_HOLD
                 else:
                     i += 1
 
-            wins = sum(1 for t in trades if t['pnl'] > 0)
-            win_rate = wins / len(trades) * 100 if trades else 0
-            profit = balance - total_deposited
+            # ============ STRATEGY 2: ML Exit Model ============
+            balance_ml = initial_balance
+            deposited_ml = initial_balance
+            trades_ml = []
+            current_month = None
 
-            print(f"  Balance: ${balance:,.2f} | Profit: ${profit:,.2f}")
-            print(f"  Trades: {len(trades)} | Win rate: {win_rate:.1f}%")
+            i = 0
+            while i < len(features_df) - MAX_HOLD:
+                month = features_df.index[i].to_period('M')
+                if current_month != month:
+                    if current_month is not None:
+                        balance_ml += monthly_deposit
+                        deposited_ml += monthly_deposit
+                    current_month = month
 
-            all_results.append({
-                'symbol': symbol,
-                'balance': balance,
-                'profit': profit,
-                'trades': len(trades),
-                'wins': wins,
-                'deposited': total_deposited
-            })
+                if best_signals[i]:
+                    entry = close_prices[i]
+                    pred = predictions[i]
+                    exit_bar = MAX_HOLD  # Default
+
+                    if has_exit_model:
+                        # Simulate checking exit model each bar
+                        for hold_bars in range(4, MAX_HOLD + 1, 4):  # Check every 4 bars
+                            if i + hold_bars >= len(features_df):
+                                break
+
+                            current_price = close_prices[i + hold_bars]
+                            if pred == 1:
+                                unrealized_pips = (current_price - entry) * 10000
+                            else:
+                                unrealized_pips = (entry - current_price) * 10000
+
+                            # Build exit features
+                            max_profit = unrealized_pips  # Simplified
+                            position_features = np.array([[
+                                hold_bars,
+                                unrealized_pips,
+                                max(unrealized_pips, 0),
+                                min(unrealized_pips, 0),
+                                0,  # pullback
+                                hold_bars / MAX_HOLD
+                            ]])
+
+                            market_features = X[i + hold_bars:i + hold_bars + 1]
+                            if len(market_features) > 0:
+                                X_exit = np.hstack([market_features, position_features])
+                                exit_pred, exit_proba = exit_trainer.predict(X_exit)
+
+                                if exit_pred[0] == 1 and exit_proba[0] > 0.6:
+                                    exit_bar = hold_bars
+                                    break
+
+                    exit_price = close_prices[i + exit_bar]
+                    pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
+                    pips -= 3
+
+                    lot = min((balance_ml * 0.02) / (40 * 10), 10.0)
+                    lot = max(0.01, round(lot, 2))
+                    pnl = pips * 10 * lot
+                    balance_ml += pnl
+                    trades_ml.append({'pnl': pnl, 'hold': exit_bar})
+                    i += exit_bar
+                else:
+                    i += 1
+
+            # Results for this symbol
+            wins_fixed = sum(1 for t in trades_fixed if t['pnl'] > 0)
+            wins_ml = sum(1 for t in trades_ml if t['pnl'] > 0)
+
+            print(f"\n  Fixed 48h Hold:")
+            print(f"    Balance: ${balance_fixed:,.2f} | Profit: ${balance_fixed - deposited_fixed:,.2f}")
+            print(f"    Trades: {len(trades_fixed)} | Win rate: {wins_fixed/len(trades_fixed)*100:.1f}%" if trades_fixed else "    No trades")
+
+            print(f"\n  ML Exit Model:")
+            print(f"    Balance: ${balance_ml:,.2f} | Profit: ${balance_ml - deposited_ml:,.2f}")
+            print(f"    Trades: {len(trades_ml)} | Win rate: {wins_ml/len(trades_ml)*100:.1f}%" if trades_ml else "    No trades")
+            if trades_ml:
+                avg_hold = sum(t['hold'] for t in trades_ml) / len(trades_ml)
+                print(f"    Avg hold: {avg_hold:.1f} bars")
+
+            results_fixed.append({'symbol': symbol, 'profit': balance_fixed - deposited_fixed, 'trades': len(trades_fixed), 'wins': wins_fixed})
+            results_ml_exit.append({'symbol': symbol, 'profit': balance_ml - deposited_ml, 'trades': len(trades_ml), 'wins': wins_ml})
+
     finally:
         collector.disconnect()
 
-    # Combined results
+    # Combined comparison
     print(f"\n{'='*60}")
-    print("COMBINED RESULTS")
+    print("COMPARISON: Fixed 48h vs ML Exit")
     print(f"{'='*60}")
 
-    total_profit = sum(r['profit'] for r in all_results)
-    total_trades = sum(r['trades'] for r in all_results)
-    total_wins = sum(r['wins'] for r in all_results)
-    avg_balance = sum(r['balance'] for r in all_results) / len(all_results)
+    fixed_profit = sum(r['profit'] for r in results_fixed)
+    ml_profit = sum(r['profit'] for r in results_ml_exit)
+    fixed_wins = sum(r['wins'] for r in results_fixed)
+    ml_wins = sum(r['wins'] for r in results_ml_exit)
+    fixed_trades = sum(r['trades'] for r in results_fixed)
+    ml_trades = sum(r['trades'] for r in results_ml_exit)
 
-    print(f"Total profit (all symbols): ${total_profit:,.2f}")
-    print(f"Average final balance: ${avg_balance:,.2f}")
-    print(f"Total trades: {total_trades}")
-    print(f"Overall win rate: {total_wins/total_trades*100:.1f}%" if total_trades > 0 else "N/A")
+    print(f"\n{'Strategy':<20} {'Profit':>15} {'Trades':>10} {'Win Rate':>10}")
+    print(f"{'-'*55}")
+    print(f"{'Fixed 48h':<20} ${fixed_profit:>14,.2f} {fixed_trades:>10} {fixed_wins/fixed_trades*100:>9.1f}%" if fixed_trades else "Fixed 48h: No trades")
+    print(f"{'ML Exit':<20} ${ml_profit:>14,.2f} {ml_trades:>10} {ml_wins/ml_trades*100:>9.1f}%" if ml_trades else "ML Exit: No trades")
+
+    if ml_profit > fixed_profit:
+        improvement = ((ml_profit - fixed_profit) / abs(fixed_profit)) * 100 if fixed_profit != 0 else 0
+        print(f"\n✓ ML Exit is BETTER by ${ml_profit - fixed_profit:,.2f} ({improvement:+.1f}%)")
+    else:
+        print(f"\n✗ Fixed 48h is better by ${fixed_profit - ml_profit:,.2f}")
 
 
 def main():
