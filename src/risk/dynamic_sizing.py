@@ -28,13 +28,15 @@ class DynamicPositionSizer:
         max_risk_pct: float = 0.04,
         min_risk_pct: float = 0.005,
         max_lot_size: float = 10.0,
-        min_lot_size: float = 0.01
+        min_lot_size: float = 0.01,
+        max_leverage: float = 20.0  # Max total leverage cap (realistic)
     ):
         self.base_risk_pct = base_risk_pct
         self.max_risk_pct = max_risk_pct
         self.min_risk_pct = min_risk_pct
         self.max_lot_size = max_lot_size
         self.min_lot_size = min_lot_size
+        self.max_leverage = max_leverage
 
         # Historical performance for Kelly
         self.trade_history = []
@@ -81,7 +83,14 @@ class DynamicPositionSizer:
         stop_pips = atr_pips * 2  # 2×ATR stop
         lot_size = risk_amount / (stop_pips * pip_value)
 
-        return round(max(self.min_lot_size, min(self.max_lot_size, lot_size)), 2)
+        # Leverage constraint: Notional value / Balance <= Max Leverage
+        # Notional = Lot * 100,000 (standard lot)
+        max_lot_by_leverage = (balance * self.max_leverage) / 100000
+
+        final_lot = min(lot_size, max_lot_by_leverage)
+        final_lot = min(max(self.min_lot_size, final_lot), self.max_lot_size)
+
+        return round(final_lot, 2)
 
     def get_regime_multiplier(self, regime: str) -> float:
         """

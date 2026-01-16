@@ -87,7 +87,7 @@ class EnsembleTrainer:
             objective='binary:logistic',
             eval_metric='logloss',
             random_state=42,
-            n_jobs=-1
+            n_jobs=1
         )
         self.models['xgboost'].fit(X_train_scaled, y_train)
 
@@ -99,7 +99,7 @@ class EnsembleTrainer:
             min_samples_split=10,
             min_samples_leaf=5,
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
             class_weight='balanced'
         )
         self.models['random_forest'].fit(X_train_scaled, y_train)
@@ -289,6 +289,11 @@ class EnsembleTrainer:
         self.feature_selector = data['feature_selector']
         self.feature_names = data['feature_names']
         self.training_metrics = data['metrics']
+
+        # FORCE n_jobs=1 to avoid library conflicts in backtest loops
+        for name, model in self.models.items():
+            if hasattr(model, 'n_jobs'):
+                model.n_jobs = 1
 
         print(f"✓ Ensemble model loaded: {name}")
         print(f"  Models: {list(self.models.keys())}")

@@ -58,13 +58,13 @@ Examples:
     trade_parser = subparsers.add_parser('trade', help='Start live or paper trading')
     trade_parser.add_argument('--mode', '-m', choices=['demo', 'real'], default='demo',
                               help='Trading mode (demo or real account)')
-    trade_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+    trade_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'EURUSD'],
                               help='Trading symbols (space-separated)')
     trade_parser.add_argument('--config', '-c', default='config/config.yaml', help='Config file')
 
     # Train ML model command
     train_parser = subparsers.add_parser('train', help='Train ML model')
-    train_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+    train_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'EURUSD'],
                               help='Trading symbols (space-separated)')
     train_parser.add_argument('--years', '-y', type=int, default=5, help='Years of data')
     train_parser.add_argument('--lookahead', type=int, default=48, help='Lookahead bars')
@@ -72,7 +72,7 @@ Examples:
 
     # ML Backtest command
     ml_backtest_parser = subparsers.add_parser('ml-backtest', help='Backtest ML model')
-    ml_backtest_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'USDCHF'],
+    ml_backtest_parser.add_argument('--symbols', '-s', nargs='+', default=['GBPUSD', 'EURUSD'],
                                     help='Trading symbols (space-separated)')
     ml_backtest_parser.add_argument('--years', '-y', type=int, default=2, help='Years to backtest')
     ml_backtest_parser.add_argument('--balance', type=float, default=100, help='Initial balance')
@@ -384,15 +384,15 @@ def cmd_trade(args):
     EXIT_CONFIDENCE = 0.6
 
     print(f"\n{'='*60}")
-    print("ADVANCED FEATURES ENABLED:")
+    print("LIVE TRADING MODE (ML Strategy):")
     print(f"{'='*60}")
-    print(f"  ✓ Session Filter (London/NY)")
-    print(f"  ✓ Regime Detection (Trend/Range)")
-    print(f"  ✓ Dynamic Position Sizing (ATR + Kelly)")
-    print(f"  ✓ Trailing Stops (2×ATR)")
-    print(f"  ✓ Correlation Manager")
     print(f"  ✓ ML Entry Model (conf > {MIN_CONFIDENCE})")
     print(f"  ✓ ML Exit Model (conf > {EXIT_CONFIDENCE})")
+    print(f"  ✓ Dynamic Position Sizing (Regime-based)")
+    print(f"  ✓ Correlation Manager")
+    print(f"  ✓ Max Hold Time (48h)")
+    print(f"  - Session Filter (DISABLED)")
+    print(f"  - Trailing Stops (DISABLED - relying on ML Exit)")
 
     print(f"\n{'='*60}")
     print("STARTING TRADING LOOP (Ctrl+C to stop)")
@@ -502,11 +502,11 @@ def cmd_trade(args):
                 if df_h1.empty:
                     continue
 
-                # === FILTER 1: Session Filter ===
-                can_trade_session, session_reason = session_filter.should_trade(symbol)
-                if not can_trade_session:
-                    print(f"  {symbol}: ⏰ {session_reason}")
-                    continue
+                # === FILTER 1: Session Filter (DISABLED for ML Strategy) ===
+                # can_trade_session, session_reason = session_filter.should_trade(symbol)
+                # if not can_trade_session:
+                #     print(f"  {symbol}: ⏰ {session_reason}")
+                #     continue
 
                 # Create features and predict
                 features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
@@ -547,7 +547,7 @@ def cmd_trade(args):
                         result = mt5.order_send(close_request)
                         if result.retcode == mt5.TRADE_RETCODE_DONE:
                             print(f"     ✓ Closed (P/L: ${pos.profit:.2f})")
-                            trailing_mgr.remove_position(pos.ticket)
+                            # trailing_mgr.remove_position(pos.ticket) # Disabled
                             correlation_mgr.remove_position(str(pos.ticket))
                         else:
                             print(f"     ✗ Failed: {result.comment}")
@@ -634,13 +634,13 @@ def cmd_trade(args):
                         print(f"     ✓ Trade executed: {result.order}")
 
                         # Add to trailing stop manager
-                        trailing_mgr.add_position(
-                            ticket=result.order,
-                            symbol=symbol,
-                            direction=signal_type,
-                            entry_price=price,
-                            atr_pips=atr_pips
-                        )
+                        # trailing_mgr.add_position(
+                        #     ticket=result.order,
+                        #     symbol=symbol,
+                        #     direction=signal_type,
+                        #     entry_price=price,
+                        #     atr_pips=atr_pips
+                        # )
 
                         # Add to correlation manager
                         correlation_mgr.add_position(str(result.order), symbol, signal_type)
@@ -769,35 +769,50 @@ def cmd_train(args):
 
 
 def cmd_ml_backtest(args):
-    """Run ML backtest for multiple symbols with exit model comparison."""
+    """Run ML backtest comparing: Fixed 48h vs ML Exit vs Full Advanced."""
     import numpy as np
 
     print(f"=" * 60)
-    print("ML BACKTEST (Entry + Exit Models)")
+    print("ML BACKTEST (3-Way Comparison)")
     print(f"=" * 60)
 
     from src.ml.data_collector import DataCollector
     from src.ml.advanced_features import AdvancedFeatureEngineer
     from src.ml.ensemble_trainer import EnsembleTrainer
     from src.ml.exit_model import ExitModelTrainer
+    from src.filters.session_filter import SessionFilter
+    from src.risk.dynamic_sizing import DynamicPositionSizer
+    from src.risk.trailing_stop import calculate_atr_pips
+
+    import MetaTrader5 as mt5
+
+    if not mt5.initialize():
+        print(f"✗ MT5 init failed: {mt5.last_error()}")
+        return
 
     symbols = args.symbols
     years = args.years
-    initial_balance = args.balance
-    monthly_deposit = args.deposit
+
+    # Get actual demo balance
+    account_info = mt5.account_info()
+    initial_balance = account_info.balance if account_info else args.balance
 
     print(f"Symbols: {', '.join(symbols)}")
     print(f"Years: {years}")
-    print(f"Initial: ${initial_balance}")
-    print(f"Monthly deposit: ${monthly_deposit}")
+    print(f"Account Balance: ${initial_balance:,.2f}")
+
+    print(f"\nStrategies being compared:")
+    print(f"  1. Fixed 48h Hold (baseline)")
+    print(f"  2. ML Exit Model")
+    print(f"  3. ADVANCED (Session + Dynamic Size + ATR Trailing)")
 
     collector = DataCollector(symbols)
-    if not collector.connect():
-        print("✗ MT5 connection failed")
-        return
+    collector.connected = True
 
-    results_fixed = []  # Fixed 48h hold
-    results_ml_exit = []  # ML exit model
+    results_fixed = []
+    results_ml_exit = []
+    results_advanced = []
+    results_hybrid = []
 
     try:
         for symbol in symbols:
@@ -838,34 +853,56 @@ def cmd_ml_backtest(args):
             close_prices = df_h1.loc[features_df.index, 'close'].values
 
             MAX_HOLD = 48
+            monthly_profits_fixed = {}
+            monthly_profits_ml = {}
+            monthly_profits_adv = {}
+            monthly_profits_hybrid = {}
+
+            # Shared components for all strategies
+            session_filter = SessionFilter()
+            position_sizer = DynamicPositionSizer(base_risk_pct=0.02, max_lot_size=10.0, max_leverage=20.0)
 
             # ============ STRATEGY 1: Fixed 48h Hold ============
             balance_fixed = initial_balance
             deposited_fixed = initial_balance
             trades_fixed = []
-            current_month = None
 
             i = 0
+            current_month = None
             while i < len(features_df) - MAX_HOLD:
-                month = features_df.index[i].to_period('M')
-                if current_month != month:
-                    if current_month is not None:
-                        balance_fixed += monthly_deposit
-                        deposited_fixed += monthly_deposit
-                    current_month = month
+                dt = features_df.index[i].to_pydatetime()
+                month_key = dt.strftime('%Y-%m')
+                if current_month != month_key:
+                    current_month = month_key
+
+                # MARGIN CALL CHECK
+                if balance_fixed < (initial_balance * 0.3):
+                    # Account blown (below 30% margin)
+                    break
+
+                if month_key not in monthly_profits_fixed:
+                    monthly_profits_fixed[month_key] = 0
 
                 if best_signals[i]:
                     entry = close_prices[i]
                     exit_price = close_prices[i + MAX_HOLD]
                     pred = predictions[i]
                     pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
-                    pips -= 3  # Spread
+                    pips -= 3
 
-                    lot = min((balance_fixed * 0.02) / (40 * 10), 10.0)
-                    lot = max(0.01, round(lot, 2))
+                    # Use dynamic ATR for sizing
+                    atr_pips_fixed = (df_h1.iloc[max(0, i-20):i+1]['high'] - df_h1.iloc[max(0, i-20):i+1]['low']).mean() * 10000
+
+                    sizing = position_sizer.calculate_position_size(
+                        balance=balance_fixed, atr_pips=atr_pips_fixed,
+                        confidence=avg_proba[i] if pred == 1 else 1-avg_proba[i],
+                        regime='trending_up' if pred == 1 else 'trending_down'
+                    )
+                    lot = sizing['lot_size']
                     pnl = pips * 10 * lot
                     balance_fixed += pnl
-                    trades_fixed.append({'pnl': pnl, 'hold': MAX_HOLD})
+                    monthly_profits_fixed[month_key] += pnl
+                    trades_fixed.append({'pnl': pnl, 'pips': pips, 'hold': MAX_HOLD})
                     i += MAX_HOLD
                 else:
                     i += 1
@@ -874,50 +911,37 @@ def cmd_ml_backtest(args):
             balance_ml = initial_balance
             deposited_ml = initial_balance
             trades_ml = []
-            current_month = None
 
             i = 0
+            current_month = None
             while i < len(features_df) - MAX_HOLD:
-                month = features_df.index[i].to_period('M')
-                if current_month != month:
-                    if current_month is not None:
-                        balance_ml += monthly_deposit
-                        deposited_ml += monthly_deposit
-                    current_month = month
+                dt = features_df.index[i].to_pydatetime()
+                month_key = dt.strftime('%Y-%m')
+                if current_month != month_key:
+                    current_month = month_key
+
+                # MARGIN CALL CHECK
+                if balance_ml < (initial_balance * 0.3):
+                    break
+
+                if month_key not in monthly_profits_ml:
+                    monthly_profits_ml[month_key] = 0
 
                 if best_signals[i]:
                     entry = close_prices[i]
                     pred = predictions[i]
-                    exit_bar = MAX_HOLD  # Default
+                    exit_bar = MAX_HOLD
 
                     if has_exit_model:
-                        # Simulate checking exit model each bar
-                        for hold_bars in range(4, MAX_HOLD + 1, 4):  # Check every 4 bars
-                            if i + hold_bars >= len(features_df):
-                                break
-
+                        for hold_bars in range(4, MAX_HOLD + 1, 4):
+                            if i + hold_bars >= len(features_df): break
                             current_price = close_prices[i + hold_bars]
-                            if pred == 1:
-                                unrealized_pips = (current_price - entry) * 10000
-                            else:
-                                unrealized_pips = (entry - current_price) * 10000
-
-                            # Build exit features
-                            max_profit = unrealized_pips  # Simplified
-                            position_features = np.array([[
-                                hold_bars,
-                                unrealized_pips,
-                                max(unrealized_pips, 0),
-                                min(unrealized_pips, 0),
-                                0,  # pullback
-                                hold_bars / MAX_HOLD
-                            ]])
-
-                            market_features = X[i + hold_bars:i + hold_bars + 1]
-                            if len(market_features) > 0:
-                                X_exit = np.hstack([market_features, position_features])
+                            unrealized = (current_price - entry) * 10000 if pred == 1 else (entry - current_price) * 10000
+                            pos_features = np.array([[hold_bars, unrealized, max(unrealized, 0), min(unrealized, 0), 0, hold_bars / MAX_HOLD]])
+                            market_feats = X[i + hold_bars:i + hold_bars + 1]
+                            if len(market_feats) > 0:
+                                X_exit = np.hstack([market_feats, pos_features])
                                 exit_pred, exit_proba = exit_trainer.predict(X_exit)
-
                                 if exit_pred[0] == 1 and exit_proba[0] > 0.6:
                                     exit_bar = hold_bars
                                     break
@@ -926,58 +950,276 @@ def cmd_ml_backtest(args):
                     pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
                     pips -= 3
 
-                    lot = min((balance_ml * 0.02) / (40 * 10), 10.0)
-                    lot = max(0.01, round(lot, 2))
+                    # Use dynamic ATR for sizing
+                    atr_pips_ml = (df_h1.iloc[max(0, i-20):i+1]['high'] - df_h1.iloc[max(0, i-20):i+1]['low']).mean() * 10000
+
+                    sizing = position_sizer.calculate_position_size(
+                        balance=balance_ml, atr_pips=atr_pips_ml,
+                        confidence=avg_proba[i] if pred == 1 else 1-avg_proba[i],
+                        regime='trending_up' if pred == 1 else 'trending_down'
+                    )
+                    lot = sizing['lot_size']
                     pnl = pips * 10 * lot
                     balance_ml += pnl
-                    trades_ml.append({'pnl': pnl, 'hold': exit_bar})
+                    monthly_profits_ml[month_key] += pnl
+                    trades_ml.append({'pnl': pnl, 'pips': pips, 'hold': exit_bar, 'lot': lot})
                     i += exit_bar
                 else:
                     i += 1
 
-            # Results for this symbol
-            wins_fixed = sum(1 for t in trades_fixed if t['pnl'] > 0)
-            wins_ml = sum(1 for t in trades_ml if t['pnl'] > 0)
+            # ============ STRATEGY 3: ADVANCED ============
+            balance_adv = initial_balance
+            deposited_adv = initial_balance
+            trades_adv = []
 
-            print(f"\n  Fixed 48h Hold:")
-            print(f"    Balance: ${balance_fixed:,.2f} | Profit: ${balance_fixed - deposited_fixed:,.2f}")
-            print(f"    Trades: {len(trades_fixed)} | Win rate: {wins_fixed/len(trades_fixed)*100:.1f}%" if trades_fixed else "    No trades")
+            i = 0
+            current_month = None
+            while i < len(features_df) - MAX_HOLD:
+                dt = features_df.index[i].to_pydatetime()
+                month_key = dt.strftime('%Y-%m')
+                if current_month != month_key:
+                    current_month = month_key
 
-            print(f"\n  ML Exit Model:")
-            print(f"    Balance: ${balance_ml:,.2f} | Profit: ${balance_ml - deposited_ml:,.2f}")
-            print(f"    Trades: {len(trades_ml)} | Win rate: {wins_ml/len(trades_ml)*100:.1f}%" if trades_ml else "    No trades")
-            if trades_ml:
-                avg_hold = sum(t['hold'] for t in trades_ml) / len(trades_ml)
-                print(f"    Avg hold: {avg_hold:.1f} bars")
+                # MARGIN CALL CHECK
+                if balance_adv < (initial_balance * 0.3):
+                    break
 
-            results_fixed.append({'symbol': symbol, 'profit': balance_fixed - deposited_fixed, 'trades': len(trades_fixed), 'wins': wins_fixed})
-            results_ml_exit.append({'symbol': symbol, 'profit': balance_ml - deposited_ml, 'trades': len(trades_ml), 'wins': wins_ml})
+                if month_key not in monthly_profits_adv:
+                    monthly_profits_adv[month_key] = 0
+
+                if best_signals[i]:
+                    can_trade, _ = session_filter.should_trade(symbol, dt)
+                    if not can_trade:
+                        i += 1
+                        continue
+
+                    entry = close_prices[i]
+                    pred = predictions[i]
+                    confidence = avg_proba[i] if pred == 1 else 1 - avg_proba[i]
+                    atr_pips = (df_h1.iloc[max(0, i-20):i+1]['high'] - df_h1.iloc[max(0, i-20):i+1]['low']).mean() * 10000
+
+                    sizing = position_sizer.calculate_position_size(
+                        balance=balance_adv, atr_pips=atr_pips, confidence=confidence,
+                        regime='trending_up' if pred == 1 else 'trending_down'
+                    )
+                    lot_size = sizing['lot_size']
+
+                    stop_pips = atr_pips * 2
+                    target_pips = atr_pips * 3
+                    exit_bar = MAX_HOLD
+                    max_profit = 0
+
+                    for hold_bars in range(1, MAX_HOLD + 1):
+                        if i + hold_bars >= len(features_df): break
+                        current_price = close_prices[i + hold_bars]
+                        pips = (current_price - entry) * 10000 if pred == 1 else (entry - current_price) * 10000
+                        max_profit = max(max_profit, pips)
+                        if max_profit - pips >= stop_pips or pips >= target_pips:
+                            exit_bar = hold_bars
+                            break
+
+                    exit_price = close_prices[i + exit_bar]
+                    pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
+                    pips -= 3
+                    pnl = pips * 10 * lot_size
+                    balance_adv += pnl
+                    monthly_profits_adv[month_key] += pnl
+                    trades_adv.append({'pnl': pnl, 'pips': pips, 'hold': exit_bar, 'lot': lot_size})
+                    i += exit_bar
+                else:
+                    i += 1
+
+            # ============ STRATEGY 4: ULTIMATE HYBRID ============
+            balance_hybrid = initial_balance
+            deposited_hybrid = initial_balance
+            trades_hybrid = []
+
+            i = 0
+            current_month = None
+            while i < len(features_df) - MAX_HOLD:
+                if current_month != month_key:
+                    current_month = month_key
+
+                # MARGIN CALL CHECK
+                if balance_hybrid < (initial_balance * 0.3):
+                    break
+
+                if month_key not in monthly_profits_hybrid:
+                    monthly_profits_hybrid[month_key] = 0
+
+                # ENTRY GATE: Unanimous + High Conf + Session
+                if best_signals[i]:
+                    can_trade, _ = session_filter.should_trade(symbol, dt)
+                    if not can_trade:
+                        i += 1
+                        continue
+
+                    entry = close_prices[i]
+                    pred = predictions[i]
+                    confidence = avg_proba[i] if pred == 1 else 1 - avg_proba[i]
+                    atr_pips_h = (df_h1.iloc[max(0, i-20):i+1]['high'] - df_h1.iloc[max(0, i-20):i+1]['low']).mean() * 10000
+
+                    # SIZING: Dynamic + Confidence Multiplier
+                    sizing = position_sizer.calculate_position_size(
+                        balance=balance_hybrid, atr_pips=atr_pips_h, confidence=confidence,
+                        regime='trending_up' if pred == 1 else 'trending_down'
+                    )
+                    lot_size_h = sizing['lot_size']
+
+                    # MULTI-LAYER EXIT
+                    stop_pips_h = atr_pips_h * 2
+                    exit_bar = MAX_HOLD
+                    max_profit = 0
+
+                    for hold_bars in range(1, MAX_HOLD + 1):
+                        if i + hold_bars >= len(features_df): break
+                        current_price = close_prices[i + hold_bars]
+                        pips_raw = (current_price - entry) * 10000 if pred == 1 else (entry - current_price) * 10000
+                        max_profit = max(max_profit, pips_raw)
+
+                        # Layer 1: ML Exit (Higher speed check every 4h)
+                        if has_exit_model and hold_bars % 4 == 0:
+                            pos_features = np.array([[hold_bars, pips_raw, max(pips_raw, 0), min(pips_raw, 0), 0, hold_bars / MAX_HOLD]])
+                            market_feats = X[i + hold_bars:i + hold_bars + 1]
+                            if len(market_feats) > 0:
+                                X_exit = np.hstack([market_feats, pos_features])
+                                exit_pred, exit_proba = exit_trainer.predict(X_exit)
+                                if exit_pred[0] == 1 and exit_proba[0] > 0.65:
+                                    exit_bar = hold_bars
+                                    break
+
+                        # Layer 2: ATR Trailing Stop
+                        if max_profit - pips_raw >= stop_pips_h:
+                            exit_bar = hold_bars
+                            break
+
+                    exit_price = close_prices[i + exit_bar]
+                    pips = (exit_price - entry) * 10000 if pred == 1 else (entry - exit_price) * 10000
+                    pips -= 3
+                    pnl = pips * 10 * lot_size_h
+                    balance_hybrid += pnl
+                    monthly_profits_hybrid[month_key] += pnl
+                    trades_hybrid.append({'pnl': pnl, 'pips': pips, 'hold': exit_bar, 'lot': lot_size_h})
+                    i += exit_bar
+                else:
+                    i += 1
+
+            # Analysis for Win Rate Explanation
+            def analyze_trades(trades, balance, total_deposited):
+                if not trades: return None
+                wins = [t for t in trades if t['pnl'] > 0]
+                losses = [t for t in trades if t['pnl'] <= 0]
+
+                total_profit = balance - total_deposited
+                wr = len(wins) / len(trades) if trades else 0
+                avg_win = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
+                avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
+
+                avg_win_pips = sum(t['pips'] for t in wins) / len(wins) if wins else 0
+                avg_loss_pips = sum(t['pips'] for t in losses) / len(losses) if losses else 0
+
+                # Leverage analysis
+                avg_lot = sum(t.get('lot', 0) for t in trades) / len(trades) if trades else 0
+                # Assuming 1 lot = 100k notional
+                avg_leverage = (avg_lot * 100000) / (total_deposited + total_profit/2) # Rough avg balance
+                max_lot = max(t.get('lot', 0) for t in trades) if trades else 0
+
+                pf = abs(sum(t['pnl'] for t in wins) / sum(t['pnl'] for t in losses)) if losses and sum(t['pnl'] for t in losses) != 0 else 0
+                rr = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+                return {
+                    'wr': wr, 'avg_win': avg_win, 'avg_loss': avg_loss,
+                    'avg_win_pips': avg_win_pips, 'avg_loss_pips': avg_loss_pips,
+                    'rr': rr, 'pf': pf, 'total_profit': total_profit,
+                    'count': len(trades), 'wins_count': len(wins), 'loss_count': len(losses),
+                    'avg_leverage': avg_leverage, 'max_lot': max_lot
+                }
+
+            stats_fixed = analyze_trades(trades_fixed, balance_fixed, deposited_fixed)
+            stats_ml = analyze_trades(trades_ml, balance_ml, deposited_ml)
+            stats_advanced = analyze_trades(trades_adv, balance_adv, deposited_adv)
+            stats_hybrid = analyze_trades(trades_hybrid, balance_hybrid, deposited_hybrid)
+
+            print(f"\n{'='*75}")
+            print(f"TRADING STATS: {symbol}")
+            print(f"{'='*75}")
+            print(f"{'Metric':<20} {'Fixed 48h':>12} {'ML Exit':>12} {'Advanced':>12} {'Hybrid':>12}")
+            print("-" * 75)
+            if stats_fixed and stats_ml and stats_advanced and stats_hybrid:
+                print(f"{'Total Trades':<20} {stats_fixed['count']:>12} {stats_ml['count']:>12} {stats_advanced['count']:>12} {stats_hybrid['count']:>12}")
+                print(f"{'Win Rate':<20} {stats_fixed['wr']*100:>11.1f}% {stats_ml['wr']*100:>11.1f}% {stats_advanced['wr']*100:>11.1f}% {stats_hybrid['wr']*100:>11.1f}%")
+                print(f"{'Profit Factor':<20} {stats_fixed['pf']:>12.2f} {stats_ml['pf']:>12.2f} {stats_advanced['pf']:>12.2f} {stats_hybrid['pf']:>12.2f}")
+                print(f"{'Avg Win ($)':<20} ${stats_fixed['avg_win']:>11.0f} ${stats_ml['avg_win']:>11.0f} ${stats_advanced['avg_win']:>11.0f} ${stats_hybrid['avg_win']:>11.0f}")
+                print(f"{'Avg Loss ($)':<20} ${stats_fixed['avg_loss']:>11.0f} ${stats_ml['avg_loss']:>11.0f} ${stats_advanced['avg_loss']:>11.0f} ${stats_hybrid['avg_loss']:>11.0f}")
+                print(f"{'Avg Win (Pips)':<20} {stats_fixed['avg_win_pips']:>12.1f} {stats_ml['avg_win_pips']:>12.1f} {stats_advanced['avg_win_pips']:>12.1f} {stats_hybrid['avg_win_pips']:>12.1f}")
+                print(f"{'Avg Loss (Pips)':<20} {stats_fixed['avg_loss_pips']:>12.1f} {stats_ml['avg_loss_pips']:>12.1f} {stats_advanced['avg_loss_pips']:>12.1f} {stats_hybrid['avg_loss_pips']:>12.1f}")
+                print(f"{'Reward:Risk':<20} {stats_fixed['rr']:>12.2f} {stats_ml['rr']:>12.2f} {stats_advanced['rr']:>12.2f} {stats_hybrid['rr']:>12.2f}")
+                print(f"{'Avg Leverage':<20} {stats_fixed['avg_leverage']:>11.1f}x {stats_ml['avg_leverage']:>11.1f}x {stats_advanced['avg_leverage']:>11.1f}x {stats_hybrid['avg_leverage']:>11.1f}x")
+                print(f"{'Max Lot Size':<20} {stats_fixed['max_lot']:>12.2f} {stats_ml['max_lot']:>12.2f} {stats_advanced['max_lot']:>12.2f} {stats_hybrid['max_lot']:>12.2f}")
+
+            print(f"\nMONTHLY PROFIT DETAILS")
+            print(f"{'Month':<10} {'Fixed':>10} {'ML Ext':>10} {'Adv':>10} {'Hybrid':>10}")
+            print("-" * 60)
+            all_months = sorted(list(set(monthly_profits_fixed.keys()) | set(monthly_profits_ml.keys()) | set(monthly_profits_adv.keys()) | set(monthly_profits_hybrid.keys())))
+            for m in all_months[-12:]: # Last 12 months
+                f_p = monthly_profits_fixed.get(m, 0)
+                m_p = monthly_profits_ml.get(m, 0)
+                a_p = monthly_profits_adv.get(m, 0)
+                h_p = monthly_profits_hybrid.get(m, 0)
+
+                h_pct = (h_p / initial_balance) * 100
+                h_icon = "✓" if h_p > 0 else "✗"
+                print(f"{m:<10} ${f_p:>7.0f}  ${m_p:>7.0f}  ${a_p:>7.0f}  ${h_p:>7.0f} ({h_pct:>3.1f}%) {h_icon}")
+
+            print(f"\n{'='*60}")
+            print(f"ACCOUNT SUMMARY: {symbol}")
+            print(f"{'='*60}")
+            print(f"  {'Strategy':<15} {'Depository':>12} {'Final Bal':>12} {'Net Profit':>12}")
+            print(f"  {'Fixed 48h':<15} ${initial_balance:>11,.0f} ${balance_fixed:>11,.0f} ${balance_fixed - deposited_fixed:>11,.0f}")
+            print(f"  {'ML Exit':<15} ${initial_balance:>11,.0f} ${balance_ml:>11,.0f} ${balance_ml - deposited_ml:>11,.0f}")
+            print(f"  {'Advanced':<15} ${initial_balance:>11,.0f} ${balance_adv:>11,.0f} ${balance_adv - deposited_adv:>11,.0f}")
+            print(f"  {'Hybrid':<15} ${initial_balance:>11,.0f} ${balance_hybrid:>11,.0f} ${balance_hybrid - deposited_hybrid:>11,.0f}")
+
+            results_fixed.append({'symbol': symbol, 'profit': balance_fixed - deposited_fixed, 'trades': len(trades_fixed), 'wins': sum(1 for t in trades_fixed if t['pnl'] > 0)})
+            results_ml_exit.append({'symbol': symbol, 'profit': balance_ml - deposited_ml, 'trades': len(trades_ml), 'wins': sum(1 for t in trades_ml if t['pnl'] > 0)})
+            results_advanced.append({'symbol': symbol, 'profit': balance_adv - deposited_adv, 'trades': len(trades_adv), 'wins': sum(1 for t in trades_adv if t['pnl'] > 0)})
+            results_hybrid.append({'symbol': symbol, 'profit': balance_hybrid - deposited_hybrid, 'trades': len(trades_hybrid), 'wins': sum(1 for t in trades_hybrid if t['pnl'] > 0)})
 
     finally:
         collector.disconnect()
 
     # Combined comparison
     print(f"\n{'='*60}")
-    print("COMPARISON: Fixed 48h vs ML Exit")
+    print("FINAL COMPARISON: All 3 Strategies")
     print(f"{'='*60}")
 
     fixed_profit = sum(r['profit'] for r in results_fixed)
     ml_profit = sum(r['profit'] for r in results_ml_exit)
-    fixed_wins = sum(r['wins'] for r in results_fixed)
-    ml_wins = sum(r['wins'] for r in results_ml_exit)
+    adv_profit = sum(r['profit'] for r in results_advanced)
+    hybrid_profit = sum(r['profit'] for r in results_hybrid)
     fixed_trades = sum(r['trades'] for r in results_fixed)
     ml_trades = sum(r['trades'] for r in results_ml_exit)
+    adv_trades = sum(r['trades'] for r in results_advanced)
+    hybrid_trades = sum(r['trades'] for r in results_hybrid)
+    fixed_wins = sum(r['wins'] for r in results_fixed)
+    ml_wins = sum(r['wins'] for r in results_ml_exit)
+    adv_wins = sum(r['wins'] for r in results_advanced)
+    hybrid_wins = sum(r['wins'] for r in results_hybrid)
 
     print(f"\n{'Strategy':<20} {'Profit':>15} {'Trades':>10} {'Win Rate':>10}")
     print(f"{'-'*55}")
-    print(f"{'Fixed 48h':<20} ${fixed_profit:>14,.2f} {fixed_trades:>10} {fixed_wins/fixed_trades*100:>9.1f}%" if fixed_trades else "Fixed 48h: No trades")
-    print(f"{'ML Exit':<20} ${ml_profit:>14,.2f} {ml_trades:>10} {ml_wins/ml_trades*100:>9.1f}%" if ml_trades else "ML Exit: No trades")
+    print(f"{'1. Fixed 48h':<20} ${fixed_profit:>14,.2f} {fixed_trades:>10} {fixed_wins/fixed_trades*100:>9.1f}%" if fixed_trades else "Fixed 48h: No trades")
+    print(f"{'2. ML Exit':<20} ${ml_profit:>14,.2f} {ml_trades:>10} {ml_wins/ml_trades*100:>9.1f}%" if ml_trades else "ML Exit: No trades")
+    print(f"{'3. ADVANCED':<20} ${adv_profit:>14,.2f} {adv_trades:>10} {adv_wins/adv_trades*100:>9.1f}%" if adv_trades else "Advanced: No trades")
+    print(f"{'4. HYBRID':<20} ${hybrid_profit:>14,.2f} {hybrid_trades:>10} {hybrid_wins/hybrid_trades*100:>9.1f}%" if hybrid_trades else "Hybrid: No trades")
 
-    if ml_profit > fixed_profit:
-        improvement = ((ml_profit - fixed_profit) / abs(fixed_profit)) * 100 if fixed_profit != 0 else 0
-        print(f"\n✓ ML Exit is BETTER by ${ml_profit - fixed_profit:,.2f} ({improvement:+.1f}%)")
-    else:
-        print(f"\n✗ Fixed 48h is better by ${fixed_profit - ml_profit:,.2f}")
+    profits = [('Fixed 48h', fixed_profit), ('ML Exit', ml_profit), ('Advanced', adv_profit), ('Hybrid', hybrid_profit)]
+    best_name, best_profit = max(profits, key=lambda x: x[1])
+    print(f"\n🏆 BEST STRATEGY: {best_name} with ${best_profit:,.2f} profit")
+
+    if best_name == 'Advanced':
+        improvement = ((adv_profit - fixed_profit) / abs(fixed_profit)) * 100 if fixed_profit != 0 else 0
+        print(f"   Advanced beats Fixed 48h by {improvement:+.1f}%")
 
 
 def main():

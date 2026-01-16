@@ -188,7 +188,7 @@ class ExitModelTrainer:
             min_samples_leaf=50,
             class_weight='balanced',
             random_state=42,
-            n_jobs=-1
+            n_jobs=1  # Set to 1 to avoid overhead in backtest loops
         )
         rf.fit(X_train, y_train)
         rf_acc = rf.score(X_test, y_test)
@@ -266,4 +266,10 @@ class ExitModelTrainer:
         self.scaler = data['scaler']
         self.feature_selector = data['feature_selector']
         self.feature_names = data['feature_names']
+
+        # FORCE n_jobs=1 to avoid library conflicts in backtest loops
+        for name, model in self.models.items():
+            if hasattr(model, 'n_jobs'):
+                model.n_jobs = 1
+
         print(f"✓ Exit model loaded: {name}")
