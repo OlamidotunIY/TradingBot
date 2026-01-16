@@ -26,7 +26,7 @@ class Database:
         """
         self.connection_string = connection_string or os.getenv(
             'MONGODB_URI',
-            'mongodb+srv://dotun:Iyanda1999.@cluster0.ybkkvnq.mongodb.net'
+            'mongodb+srv://dotun:Iyanda1999.@cluster0.ybkkvnq.mongodb.net/trading_bot?retryWrites=true&w=majority'
         )
         self.db_name = db_name
         self.client: Optional[MongoClient] = None
