@@ -291,14 +291,14 @@ def cmd_trade(args):
     print(f"=" * 60)
     print(f"Symbols: {', '.join(symbols)}")
 
-    # Load environment based on mode
+    # Load environment based on mode (with hardcoded fallbacks for demo)
     from dotenv import load_dotenv
     load_dotenv()
 
     if mode == 'demo':
-        login = os.getenv('MT5_DEMO_LOGIN') or os.getenv('MT5_LOGIN')
-        password = os.getenv('MT5_DEMO_PASSWORD') or os.getenv('MT5_PASSWORD')
-        server = os.getenv('MT5_DEMO_SERVER') or os.getenv('MT5_SERVER')
+        login = os.getenv('MT5_DEMO_LOGIN') or os.getenv('MT5_LOGIN') or '213790354'
+        password = os.getenv('MT5_DEMO_PASSWORD') or os.getenv('MT5_PASSWORD') or 'vy5XEd#9'
+        server = os.getenv('MT5_DEMO_SERVER') or os.getenv('MT5_SERVER') or 'OctaFX-Demo'
     else:
         login = os.getenv('MT5_REAL_LOGIN')
         password = os.getenv('MT5_REAL_PASSWORD')
@@ -359,6 +359,7 @@ def cmd_trade(args):
     print(f"  Risk: {RISK_PER_TRADE*100}%")
     print(f"  Max Lot: {MAX_LOT_SIZE}")
     print(f"  Min Confidence: {MIN_CONFIDENCE}")
+    print(f"  Hold Period: 48 hours")
 
     print(f"\n{'='*60}")
     print("STARTING TRADING LOOP (Ctrl+C to stop)")
@@ -367,10 +368,51 @@ def cmd_trade(args):
     collector = DataCollector(list(models.keys()))
     collector.connect()
 
+    HOLD_HOURS = 48  # Close trades after 48 hours
+
     try:
         while True:
             now = datetime.now()
             print(f"\n[{now.strftime('%H:%M:%S')}] Checking signals...")
+
+            # First, check if any positions need to be closed (48h hold)
+            all_positions = mt5.positions_get()
+            if all_positions:
+                for pos in all_positions:
+                    if pos.magic == 123456:  # Only our trades
+                        open_time = datetime.fromtimestamp(pos.time)
+                        hours_open = (now - open_time).total_seconds() / 3600
+
+                        if hours_open >= HOLD_HOURS:
+                            # Close the position
+                            tick = mt5.symbol_info_tick(pos.symbol)
+                            close_price = tick.bid if pos.type == 0 else tick.ask  # BUY->bid, SELL->ask
+
+                            close_request = {
+                                "action": mt5.TRADE_ACTION_DEAL,
+                                "symbol": pos.symbol,
+                                "volume": pos.volume,
+                                "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                                "position": pos.ticket,
+                                "price": close_price,
+                                "deviation": 20,
+                                "magic": 123456,
+                                "comment": "ML Close",
+                                "type_time": mt5.ORDER_TIME_GTC,
+                                "type_filling": mt5.ORDER_FILLING_FOK,
+                            }
+
+                            result = mt5.order_send(close_request)
+                            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                                print(f"  📤 Closed {pos.symbol} (held {hours_open:.1f}h) | P/L: ${pos.profit:.2f}")
+                                db.update_trade(pos.ticket, {
+                                    'status': 'CLOSED',
+                                    'exit_price': close_price,
+                                    'profit': pos.profit,
+                                    'exit_time': now
+                                })
+                            else:
+                                print(f"  ✗ Failed to close {pos.symbol}: {result.comment}")
 
             for symbol, ensemble in models.items():
                 # Get data
@@ -381,7 +423,7 @@ def cmd_trade(args):
                 if df_h1.empty:
                     continue
 
-                # Create features and predict
+                # Create features and predict FIRST
                 features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
                 X = features_df[engineer.get_feature_names()].tail(1).values
                 predictions, avg_proba, unanimous = ensemble.predict(X)
@@ -390,9 +432,46 @@ def cmd_trade(args):
                 proba = avg_proba[0]
                 is_unanimous = unanimous[0]
                 is_high_conf = proba > MIN_CONFIDENCE or proba < (1 - MIN_CONFIDENCE)
+                new_signal = 'BUY' if pred == 1 else 'SELL'
+
+                # Check if already have open position for this symbol
+                positions = mt5.positions_get(symbol=symbol)
+                if positions:
+                    pos = positions[0]
+                    current_direction = 'BUY' if pos.type == 0 else 'SELL'
+
+                    # If signal contradicts, close the position
+                    if is_unanimous and is_high_conf and new_signal != current_direction:
+                        print(f"  🔄 {symbol}: Signal reversed! Closing {current_direction}...")
+                        tick = mt5.symbol_info_tick(symbol)
+                        close_price = tick.bid if pos.type == 0 else tick.ask
+
+                        close_request = {
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "symbol": symbol,
+                            "volume": pos.volume,
+                            "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                            "position": pos.ticket,
+                            "price": close_price,
+                            "deviation": 20,
+                            "magic": 123456,
+                            "comment": "ML Reverse",
+                            "type_time": mt5.ORDER_TIME_GTC,
+                            "type_filling": mt5.ORDER_FILLING_FOK,
+                        }
+                        result = mt5.order_send(close_request)
+                        if result.retcode == mt5.TRADE_RETCODE_DONE:
+                            print(f"     ✓ Closed (P/L: ${pos.profit:.2f})")
+                            # Don't continue - allow opening new trade below
+                        else:
+                            print(f"     ✗ Failed: {result.comment}")
+                            continue
+                    else:
+                        print(f"  {symbol}: Position open (ticket {pos.ticket})")
+                        continue
 
                 if is_unanimous and is_high_conf:
-                    signal_type = 'BUY' if pred == 1 else 'SELL'
+                    signal_type = new_signal
                     confidence = proba if pred == 1 else 1 - proba
 
                     print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%}")
@@ -419,17 +498,26 @@ def cmd_trade(args):
                         continue
                     price = tick.ask if signal_type == 'BUY' else tick.bid
 
+                    # Get supported filling mode for OctaFX (try FOK first, then RETURN)
+                    symbol_info = mt5.symbol_info(symbol)
+                    if symbol_info.filling_mode & 1:  # FOK supported
+                        filling_mode = mt5.ORDER_FILLING_FOK
+                    elif symbol_info.filling_mode & 2:  # IOC supported
+                        filling_mode = mt5.ORDER_FILLING_IOC
+                    else:  # RETURN (partial fill)
+                        filling_mode = mt5.ORDER_FILLING_RETURN
+
                     request = {
                         "action": mt5.TRADE_ACTION_DEAL,
                         "symbol": symbol,
                         "volume": lot_size,
                         "type": order_type,
                         "price": price,
-                        "deviation": 10,
+                        "deviation": 20,
                         "magic": 123456,
                         "comment": f"ML {signal_type}",
                         "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": mt5.ORDER_FILLING_IOC,
+                        "type_filling": filling_mode,
                     }
 
                     result = mt5.order_send(request)
@@ -445,7 +533,7 @@ def cmd_trade(args):
                             'mode': mode,
                             'strategy': 'ensemble_ml',
                             'confidence': confidence,
-                            'entry_time': datetime.utcnow()
+                            'entry_time': datetime.now(tz=__import__('datetime').timezone.utc)
                         })
                     else:
                         print(f"     ✗ Trade failed: {result.comment}")
