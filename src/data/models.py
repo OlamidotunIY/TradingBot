@@ -1,47 +1,88 @@
 """
-Models - SQLAlchemy Database Models
+Pydantic Models for Trading Bot
 
-This module defines database models for trades, positions, and logs.
+Defines data models for trades, signals, and performance logs.
 """
-
-from sqlalchemy import Column, Integer, Float, String, DateTime, Boolean, Text
-from sqlalchemy.ext.declarative import declarative_base
+from pydantic import BaseModel, Field
+from typing import Optional, List
 from datetime import datetime
+from enum import Enum
 
-Base = declarative_base()
+
+class TradingMode(str, Enum):
+    """Trading mode."""
+    DEMO = "demo"
+    REAL = "real"
 
 
-class Trade(Base):
-    """Trade history model."""
+class SignalType(str, Enum):
+    """Signal type."""
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
 
-    __tablename__ = 'trades'
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    ticket = Column(Integer, unique=True, nullable=False)
-    symbol = Column(String(20), nullable=False)
-    type = Column(String(10), nullable=False)  # BUY, SELL
-    volume = Column(Float, nullable=False)
-    entry_price = Column(Float, nullable=False)
-    exit_price = Column(Float)
-    sl = Column(Float)
-    tp = Column(Float)
-    profit = Column(Float, default=0.0)
-    pips = Column(Float, default=0.0)
-    commission = Column(Float, default=0.0)
-    swap = Column(Float, default=0.0)
-    magic = Column(Integer, default=0)
-    strategy = Column(String(50))
-    comment = Column(Text)
-    status = Column(String(20), default='OPEN')  # OPEN, CLOSED, SL_HIT, TP_HIT
-    entry_time = Column(DateTime, nullable=False)
-    exit_time = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+class TradeStatus(str, Enum):
+    """Trade status."""
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    SL_HIT = "SL_HIT"
+    TP_HIT = "TP_HIT"
 
-    def to_dict(self):
-        """Convert to dictionary."""
+
+class Signal(BaseModel):
+    """Trading signal model."""
+    symbol: str
+    signal_type: SignalType
+    confidence: float = Field(ge=0, le=1)
+    price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    reason: Optional[str] = None
+    strategy: Optional[str] = None
+    mode: TradingMode = TradingMode.DEMO
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
         return {
-            'id': self.id,
+            'symbol': self.symbol,
+            'signal_type': self.signal_type.value,
+            'confidence': self.confidence,
+            'price': self.price,
+            'sl': self.sl,
+            'tp': self.tp,
+            'reason': self.reason,
+            'strategy': self.strategy,
+            'mode': self.mode.value,
+            'created_at': self.created_at
+        }
+
+
+class Trade(BaseModel):
+    """Trade model."""
+    ticket: int
+    symbol: str
+    type: str  # BUY or SELL
+    volume: float
+    entry_price: float
+    exit_price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    profit: float = 0.0
+    pips: float = 0.0
+    commission: float = 0.0
+    swap: float = 0.0
+    magic: int = 0
+    strategy: Optional[str] = None
+    comment: Optional[str] = None
+    status: TradeStatus = TradeStatus.OPEN
+    mode: TradingMode = TradingMode.DEMO
+    entry_time: datetime
+    exit_time: Optional[datetime] = None
+    confidence: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
             'ticket': self.ticket,
             'symbol': self.symbol,
             'type': self.type,
@@ -57,74 +98,30 @@ class Trade(Base):
             'magic': self.magic,
             'strategy': self.strategy,
             'comment': self.comment,
-            'status': self.status,
-            'entry_time': self.entry_time.isoformat() if self.entry_time else None,
-            'exit_time': self.exit_time.isoformat() if self.exit_time else None
+            'status': self.status.value,
+            'mode': self.mode.value,
+            'entry_time': self.entry_time,
+            'exit_time': self.exit_time,
+            'confidence': self.confidence
         }
 
 
-class Position(Base):
-    """Open position snapshot model."""
+class PerformanceLog(BaseModel):
+    """Daily performance log."""
+    date: datetime
+    starting_balance: float
+    ending_balance: Optional[float] = None
+    daily_profit: float = 0.0
+    daily_return_pct: float = 0.0
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    max_drawdown: float = 0.0
+    mode: TradingMode = TradingMode.DEMO
 
-    __tablename__ = 'positions'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    ticket = Column(Integer, nullable=False)
-    symbol = Column(String(20), nullable=False)
-    type = Column(String(10), nullable=False)
-    volume = Column(Float, nullable=False)
-    open_price = Column(Float, nullable=False)
-    current_price = Column(Float)
-    sl = Column(Float)
-    tp = Column(Float)
-    profit = Column(Float, default=0.0)
-    magic = Column(Integer, default=0)
-    strategy = Column(String(50))
-    open_time = Column(DateTime, nullable=False)
-    snapshot_time = Column(DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        """Convert to dictionary."""
+    def to_dict(self) -> dict:
         return {
-            'id': self.id,
-            'ticket': self.ticket,
-            'symbol': self.symbol,
-            'type': self.type,
-            'volume': self.volume,
-            'open_price': self.open_price,
-            'current_price': self.current_price,
-            'sl': self.sl,
-            'tp': self.tp,
-            'profit': self.profit,
-            'magic': self.magic,
-            'strategy': self.strategy,
-            'open_time': self.open_time.isoformat() if self.open_time else None,
-            'snapshot_time': self.snapshot_time.isoformat() if self.snapshot_time else None
-        }
-
-
-class PerformanceLog(Base):
-    """Daily performance log model."""
-
-    __tablename__ = 'performance_logs'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(DateTime, nullable=False)
-    starting_balance = Column(Float, nullable=False)
-    ending_balance = Column(Float)
-    daily_profit = Column(Float, default=0.0)
-    daily_return_pct = Column(Float, default=0.0)
-    total_trades = Column(Integer, default=0)
-    winning_trades = Column(Integer, default=0)
-    losing_trades = Column(Integer, default=0)
-    max_drawdown = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        """Convert to dictionary."""
-        return {
-            'id': self.id,
-            'date': self.date.isoformat() if self.date else None,
+            'date': self.date,
             'starting_balance': self.starting_balance,
             'ending_balance': self.ending_balance,
             'daily_profit': self.daily_profit,
@@ -132,51 +129,6 @@ class PerformanceLog(Base):
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
             'losing_trades': self.losing_trades,
-            'max_drawdown': self.max_drawdown
-        }
-
-
-class BacktestResult(Base):
-    """Backtest result storage model."""
-
-    __tablename__ = 'backtest_results'
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    result_id = Column(String(50), unique=True, nullable=False)
-    strategy_name = Column(String(50), nullable=False)
-    symbol = Column(String(20), nullable=False)
-    timeframe = Column(String(10))
-    start_date = Column(DateTime)
-    end_date = Column(DateTime)
-    initial_balance = Column(Float)
-    final_balance = Column(Float)
-    total_profit = Column(Float)
-    return_pct = Column(Float)
-    total_trades = Column(Integer)
-    win_rate = Column(Float)
-    profit_factor = Column(Float)
-    max_drawdown = Column(Float)
-    sharpe_ratio = Column(Float)
-    metrics_json = Column(Text)  # Store full metrics as JSON
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        """Convert to dictionary."""
-        return {
-            'id': self.id,
-            'result_id': self.result_id,
-            'strategy_name': self.strategy_name,
-            'symbol': self.symbol,
-            'timeframe': self.timeframe,
-            'start_date': self.start_date.isoformat() if self.start_date else None,
-            'end_date': self.end_date.isoformat() if self.end_date else None,
-            'initial_balance': self.initial_balance,
-            'final_balance': self.final_balance,
-            'total_profit': self.total_profit,
-            'return_pct': self.return_pct,
-            'total_trades': self.total_trades,
-            'win_rate': self.win_rate,
-            'profit_factor': self.profit_factor,
             'max_drawdown': self.max_drawdown,
-            'sharpe_ratio': self.sharpe_ratio
+            'mode': self.mode.value
         }

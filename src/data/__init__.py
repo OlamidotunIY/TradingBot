@@ -1,5 +1,15 @@
-# Data modules
+"""
+Data module exports.
+"""
 from .database import Database
-from .models import Trade, Position, PerformanceLog
+from .models import Trade, Signal, PerformanceLog, TradingMode, SignalType, TradeStatus
 
-__all__ = ['Database', 'Trade', 'Position', 'PerformanceLog']
+__all__ = [
+    'Database',
+    'Trade',
+    'Signal',
+    'PerformanceLog',
+    'TradingMode',
+    'SignalType',
+    'TradeStatus'
+]

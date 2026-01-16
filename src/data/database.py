@@ -1,98 +1,134 @@
 """
-Database - SQLite Database Handler
+MongoDB Database Handler
 
-This module handles database connections and operations.
+Handles connections and operations for MongoDB Atlas.
 """
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import StaticPool
-from typing import Optional, Generator
-from pathlib import Path
+from pymongo import MongoClient
+from pymongo.database import Database as MongoDatabase
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 import logging
-
-from .models import Base
+import os
 
 logger = logging.getLogger('trading_bot')
 
 
 class Database:
-    """SQLite database handler."""
+    """MongoDB database handler."""
 
-    def __init__(self, db_path: str = 'data/trading_bot.db'):
+    def __init__(self, connection_string: str = None, db_name: str = 'trading_bot'):
         """
-        Initialize Database.
+        Initialize MongoDB connection.
 
         Args:
-            db_path: Path to SQLite database file
+            connection_string: MongoDB Atlas connection string
+            db_name: Database name
         """
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Create engine
-        self.engine = create_engine(
-            f'sqlite:///{self.db_path}',
-            connect_args={'check_same_thread': False},
-            poolclass=StaticPool,
-            echo=False
+        self.connection_string = connection_string or os.getenv(
+            'MONGODB_URI',
+            'mongodb+srv://dotun:Iyanda1999.@cluster0.ybkkvnq.mongodb.net'
         )
+        self.db_name = db_name
+        self.client: Optional[MongoClient] = None
+        self.db: Optional[MongoDatabase] = None
+        self._connected = False
 
-        # Create session factory
-        self.SessionLocal = sessionmaker(
-            autocommit=False,
-            autoflush=False,
-            bind=self.engine
-        )
-
-        self._initialized = False
+    def connect(self) -> bool:
+        """Connect to MongoDB."""
+        try:
+            self.client = MongoClient(self.connection_string)
+            self.db = self.client[self.db_name]
+            # Test connection
+            self.client.admin.command('ping')
+            self._connected = True
+            logger.info(f"Connected to MongoDB: {self.db_name}")
+            return True
+        except Exception as e:
+            logger.error(f"MongoDB connection failed: {e}")
+            return False
 
     def init_db(self) -> None:
-        """Initialize database tables."""
-        Base.metadata.create_all(bind=self.engine)
-        self._initialized = True
-        logger.info(f"Database initialized: {self.db_path}")
+        """Initialize database (connect if needed)."""
+        if not self._connected:
+            self.connect()
 
-    def get_session(self) -> Session:
+    # ==================== TRADES ====================
+
+    def save_trade(self, trade: Dict[str, Any]) -> str:
         """
-        Get a new database session.
+        Save a trade to the database.
+
+        Args:
+            trade: Trade data dictionary
 
         Returns:
-            Session: SQLAlchemy session
+            Inserted document ID
         """
-        if not self._initialized:
-            self.init_db()
+        trade['created_at'] = datetime.utcnow()
+        trade['updated_at'] = datetime.utcnow()
+        result = self.db.trades.insert_one(trade)
+        logger.info(f"Trade saved: {result.inserted_id}")
+        return str(result.inserted_id)
 
-        return self.SessionLocal()
+    def update_trade(self, ticket: int, updates: Dict[str, Any]) -> bool:
+        """Update a trade by ticket number."""
+        updates['updated_at'] = datetime.utcnow()
+        result = self.db.trades.update_one(
+            {'ticket': ticket},
+            {'$set': updates}
+        )
+        return result.modified_count > 0
 
-    def session_scope(self) -> Generator[Session, None, None]:
-        """
-        Provide a transactional scope around a series of operations.
+    def get_trades(self, mode: str = None, limit: int = 100) -> List[Dict]:
+        """Get trades, optionally filtered by mode."""
+        query = {}
+        if mode:
+            query['mode'] = mode
+        return list(self.db.trades.find(query).sort('created_at', -1).limit(limit))
 
-        Usage:
-            with db.session_scope() as session:
-                session.query(...)
+    def get_trade_by_ticket(self, ticket: int) -> Optional[Dict]:
+        """Get a trade by ticket number."""
+        return self.db.trades.find_one({'ticket': ticket})
 
-        Yields:
-            Session: Database session
-        """
-        session = self.get_session()
-        try:
-            yield session
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+    # ==================== SIGNALS ====================
+
+    def save_signal(self, signal: Dict[str, Any]) -> str:
+        """Save a trading signal."""
+        signal['created_at'] = datetime.utcnow()
+        result = self.db.signals.insert_one(signal)
+        return str(result.inserted_id)
+
+    def get_signals(self, symbol: str = None, limit: int = 100) -> List[Dict]:
+        """Get signals, optionally filtered by symbol."""
+        query = {}
+        if symbol:
+            query['symbol'] = symbol
+        return list(self.db.signals.find(query).sort('created_at', -1).limit(limit))
+
+    # ==================== PERFORMANCE ====================
+
+    def save_performance_log(self, log: Dict[str, Any]) -> str:
+        """Save daily performance log."""
+        log['created_at'] = datetime.utcnow()
+        result = self.db.performance_logs.insert_one(log)
+        return str(result.inserted_id)
+
+    def get_performance_logs(self, days: int = 30) -> List[Dict]:
+        """Get recent performance logs."""
+        return list(self.db.performance_logs.find().sort('date', -1).limit(days))
+
+    # ==================== UTILITY ====================
 
     def close(self) -> None:
         """Close database connection."""
-        self.engine.dispose()
-        logger.info("Database connection closed")
+        if self.client:
+            self.client.close()
+            self._connected = False
+            logger.info("MongoDB connection closed")
 
     def __enter__(self):
         """Context manager entry."""
-        self.init_db()
+        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

@@ -24,6 +24,7 @@ pydantic
 
 # Database
 sqlalchemy
+pymongo[srv]
 
 # HTTP Client (for CLI status check)
 requests
