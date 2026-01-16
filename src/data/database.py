@@ -36,7 +36,11 @@ class Database:
     def connect(self) -> bool:
         """Connect to MongoDB."""
         try:
-            self.client = MongoClient(self.connection_string)
+            # Use tlsAllowInvalidCertificates for Windows servers with SSL issues
+            self.client = MongoClient(
+                self.connection_string,
+                tlsAllowInvalidCertificates=True
+            )
             self.db = self.client[self.db_name]
             # Test connection
             self.client.admin.command('ping')
