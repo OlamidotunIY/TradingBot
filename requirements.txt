@@ -1,0 +1,39 @@
+# MT5 Trading Bot Dependencies
+
+# MT5 Connection
+MetaTrader5
+
+# Data Processing
+pandas
+numpy
+
+# Technical Analysis
+pandas-ta
+
+# Configuration
+pyyaml
+python-dotenv
+
+# Visualization
+matplotlib
+
+# API Server
+fastapi
+uvicorn[standard]
+pydantic
+
+# Database
+sqlalchemy
+
+# HTTP Client (for CLI status check)
+requests
+
+# Testing (optional)
+pytest
+pytest-asyncio
+
+# Machine Learning
+scikit-learn
+joblib
+xgboost
+tensorflow

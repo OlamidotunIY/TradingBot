@@ -1,0 +1,51 @@
+# Main configuration for MT5 Trading Bot
+
+mt5:
+  # MT5 account credentials (use environment variables in production)
+  login: ${MT5_LOGIN}
+  password: ${MT5_PASSWORD}
+  server: ${MT5_SERVER}
+  path: "C:/Program Files/MetaTrader 5/terminal64.exe"
+  timeout: 60000
+
+trading:
+  # Default trading settings
+  symbols:
+    - EURUSD
+    - GBPUSD
+    - USDJPY
+  default_timeframe: M15  # M1, M5, M15, H1, H4, D1
+  magic_number: 123456
+  deviation: 20  # Maximum price deviation in points
+
+  # Trading hours (24h format, UTC)
+  trading_hours:
+    start: "08:00"
+    end: "22:00"
+
+  # Days to trade (0=Monday, 6=Sunday)
+  trading_days: [0, 1, 2, 3, 4]
+
+risk:
+  # Risk management settings
+  max_risk_per_trade: 0.02  # 2% of account balance
+  max_daily_drawdown: 0.05  # 5% daily loss limit
+  max_open_positions: 5
+  max_positions_per_symbol: 2
+
+  # Stop loss and take profit
+  default_sl_pips: 50
+  default_tp_pips: 100
+  trailing_stop: true
+  trailing_stop_pips: 30
+
+database:
+  type: sqlite
+  path: data/trading_bot.db
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:5173"  # Vite default
+    - "http://localhost:3000"

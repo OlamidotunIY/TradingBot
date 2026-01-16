@@ -1,0 +1,53 @@
+# Strategy configuration for MT5 Trading Bot
+
+# Global strategy settings
+global:
+  check_interval: 60  # Seconds between strategy checks
+  enable_all: false   # If true, enables all strategies by default
+
+# Individual strategy configurations
+strategies:
+  sma_crossover:
+    enabled: true
+    description: "Simple Moving Average Crossover Strategy"
+    symbols:
+      - EURUSD
+      - GBPUSD
+    timeframe: H1
+    parameters:
+      fast_period: 10
+      slow_period: 20
+      signal_threshold: 0.0001
+    risk:
+      risk_per_trade: 0.01  # 1% risk per trade
+      sl_multiplier: 1.5    # ATR multiplier for SL
+      tp_multiplier: 2.0    # ATR multiplier for TP
+
+  rsi_strategy:
+    enabled: true
+    description: "RSI Overbought/Oversold Strategy"
+    symbols:
+      - EURUSD
+      - USDJPY
+    timeframe: M15
+    parameters:
+      rsi_period: 14
+      overbought: 70
+      oversold: 30
+      confirmation_candles: 2
+    risk:
+      risk_per_trade: 0.015
+      sl_multiplier: 1.0
+      tp_multiplier: 1.5
+
+  # Template for adding new strategies
+  # strategy_name:
+  #   enabled: false
+  #   description: "Strategy description"
+  #   symbols: []
+  #   timeframe: H1
+  #   parameters: {}
+  #   risk:
+  #     risk_per_trade: 0.01
+  #     sl_multiplier: 1.0
+  #     tp_multiplier: 2.0
