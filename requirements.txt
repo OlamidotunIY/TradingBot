@@ -4,11 +4,11 @@
 MetaTrader5
 
 # Data Processing
-pandas
-numpy
+pandas==2.2.2
+numpy<2.0.0
 
 # Technical Analysis
-pandas-ta
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@development
 
 # Configuration
 pyyaml
@@ -33,7 +33,7 @@ pytest
 pytest-asyncio
 
 # Machine Learning
-scikit-learn
+scikit-learn==1.4.2
 joblib
 xgboost
-tensorflow
+# tensorflow (removed to save memory on t2.micro)
