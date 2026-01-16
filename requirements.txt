@@ -33,7 +33,7 @@ pytest
 pytest-asyncio
 
 # Machine Learning
-scikit-learn==1.4.2
+scikit-learn
 joblib
 xgboost
 # tensorflow (removed to save memory on t2.micro)
