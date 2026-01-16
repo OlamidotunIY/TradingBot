@@ -4,8 +4,8 @@
 MetaTrader5
 
 # Data Processing
-pandas==2.2.2
-numpy<2.0.0
+pandas
+numpy
 
 # Technical Analysis
 pandas-ta
