@@ -71,8 +71,13 @@ class AdvancedFeatureEngineer:
         """Add core technical indicators."""
         # Trend indicators
         for period in [10, 20, 50, 100, 200]:
-            df[f'sma_{period}'] = ta.sma(df['close'], length=period)
-            df[f'sma_{period}_slope'] = (df[f'sma_{period}'].diff(5) / df[f'sma_{period}']).fillna(0)
+            sma = ta.sma(df['close'], length=period)
+            df[f'sma_{period}'] = sma
+            # Only calculate slope if we have valid SMA values
+            if sma is not None and not sma.isna().all():
+                df[f'sma_{period}_slope'] = (sma.diff(5) / sma).fillna(0)
+            else:
+                df[f'sma_{period}_slope'] = 0
 
         for period in [9, 21, 50]:
             df[f'ema_{period}'] = ta.ema(df['close'], length=period)
@@ -350,35 +355,37 @@ class AdvancedFeatureEngineer:
         return df
 
     def _add_swing_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add swing point quality features for entry timing (vectorized for performance)."""
-        # Use rolling window for recent highs/lows
+        """Add swing point quality features for entry timing (optimized to avoid fragmentation)."""
         lookback = 20
-        df['recent_low'] = df['low'].rolling(lookback).min()
-        df['recent_high'] = df['high'].rolling(lookback).max()
 
-        # Near swing low (within 0.5% of recent low)
-        df['near_swing_low'] = (abs(df['close'] - df['recent_low']) / (df['close'] + 1e-10) < 0.005).astype(int)
-        df['near_swing_high'] = (abs(df['close'] - df['recent_high']) / (df['close'] + 1e-10) < 0.005).astype(int)
+        # Calculate temporary series (don't assign to df yet)
+        recent_low = df['low'].rolling(lookback).min()
+        recent_high = df['high'].rolling(lookback).max()
 
-        # Bars since swing low/high (vectorized approach)
         # Identify when we hit a new low/high
-        at_low = (df['low'] == df['recent_low']).astype(int)
-        at_high = (df['high'] == df['recent_high']).astype(int)
+        at_low = (df['low'] == recent_low).astype(int)
+        at_high = (df['high'] == recent_high).astype(int)
 
-        # Group by cumulative sum of hits to get periods between lows/highs
+        # Group by cumulative sum
         low_groups = at_low.cumsum()
         high_groups = at_high.cumsum()
 
-        # Count within each group
-        df['bars_since_low'] = df.groupby(low_groups).cumcount()
-        df['bars_since_high'] = df.groupby(high_groups).cumcount()
+        # Build all new columns in a dict, then add all at once
+        new_cols = pd.DataFrame({
+            'recent_low': recent_low,
+            'recent_high': recent_high,
+            'near_swing_low': (abs(df['close'] - recent_low) / (df['close'] + 1e-10) < 0.005).astype(int),
+            'near_swing_high': (abs(df['close'] - recent_high) / (df['close'] + 1e-10) < 0.005).astype(int),
+            'bars_since_low': df.groupby(low_groups).cumcount(),
+            'bars_since_high': df.groupby(high_groups).cumcount(),
+        }, index=df.index)
 
-        # Bounce from swing low (price moved up after touching low within last 5 bars)
-        df['bouncing_from_low'] = ((df['bars_since_low'] < 5) & (df['close'] > df['recent_low'])).astype(int)
-        df['rejecting_from_high'] = ((df['bars_since_high'] < 5) & (df['close'] < df['recent_high'])).astype(int)
+        # Add dependent features
+        new_cols['bouncing_from_low'] = ((new_cols['bars_since_low'] < 5) & (df['close'] > recent_low)).astype(int)
+        new_cols['rejecting_from_high'] = ((new_cols['bars_since_high'] < 5) & (df['close'] < recent_high)).astype(int)
 
-        return df
+        # Add all at once to avoid fragmentation
+        return pd.concat([df, new_cols], axis=1)
 
     def get_feature_names(self) -> List[str]:
         return self.feature_names
-
