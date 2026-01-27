@@ -7,6 +7,9 @@ import pandas_ta as ta
 from typing import Dict, List, Optional, Tuple
 import logging
 
+# Suppress FutureWarning for downcasting (opt-in to future behavior)
+pd.set_option('future.no_silent_downcasting', True)
+
 logger = logging.getLogger('trading_bot')
 
 
