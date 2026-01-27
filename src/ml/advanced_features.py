@@ -288,26 +288,21 @@ class AdvancedFeatureEngineer:
 
     def _add_retracement_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add retracement and pullback detection features."""
-        # Calculate swing highs and lows (local extrema)
-        swing_period = 10
-        df['swing_high'] = df['high'].rolling(window=swing_period*2+1, center=True).max() == df['high']
-        df['swing_low'] = df['low'].rolling(window=swing_period*2+1, center=True).min() == df['low']
-
-        # Forward fill swing levels for comparison
-        df['last_swing_high'] = df.loc[df['swing_high'], 'high'].ffill()
-        df['last_swing_low'] = df.loc[df['swing_low'], 'low'].ffill()
+        # Calculate swing highs and lows (local extrema) - use min/max without center
+        lookback = 20
+        df['recent_swing_high'] = df['high'].rolling(window=lookback).max()
+        df['recent_swing_low'] = df['low'].rolling(window=lookback).min()
 
         # Retracement depth from recent high/low
-        if 'last_swing_high' in df.columns and 'last_swing_low' in df.columns:
-            swing_range = df['last_swing_high'] - df['last_swing_low']
-            df['retracement_from_high'] = (df['last_swing_high'] - df['close']) / (swing_range + 1e-10)
-            df['retracement_from_low'] = (df['close'] - df['last_swing_low']) / (swing_range + 1e-10)
+        swing_range = df['recent_swing_high'] - df['recent_swing_low']
+        df['retracement_from_high'] = ((df['recent_swing_high'] - df['close']) / (swing_range + 1e-10)).fillna(0.5)
+        df['retracement_from_low'] = ((df['close'] - df['recent_swing_low']) / (swing_range + 1e-10)).fillna(0.5)
 
-            # In retracement zone? (38.2% to 61.8% fibonacci)
-            df['in_buy_retracement'] = ((df['retracement_from_high'] > 0.382) &
-                                        (df['retracement_from_high'] < 0.618)).astype(int)
-            df['in_sell_retracement'] = ((df['retracement_from_low'] > 0.382) &
-                                         (df['retracement_from_low'] < 0.618)).astype(int)
+        # In retracement zone? (38.2% to 61.8% fibonacci)
+        df['in_buy_retracement'] = ((df['retracement_from_high'] > 0.382) &
+                                    (df['retracement_from_high'] < 0.618)).astype(int)
+        df['in_sell_retracement'] = ((df['retracement_from_low'] > 0.382) &
+                                     (df['retracement_from_low'] < 0.618)).astype(int)
 
         # Pullback detection (price pulled back but trend intact)
         if 'sma_20' in df.columns and 'sma_50' in df.columns:
@@ -355,32 +350,30 @@ class AdvancedFeatureEngineer:
         return df
 
     def _add_swing_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add swing point quality features for entry timing."""
-        # Identify quality swing lows (for buy entries)
+        """Add swing point quality features for entry timing (vectorized for performance)."""
+        # Use rolling window for recent highs/lows
         lookback = 20
         df['recent_low'] = df['low'].rolling(lookback).min()
         df['recent_high'] = df['high'].rolling(lookback).max()
 
         # Near swing low (within 0.5% of recent low)
-        df['near_swing_low'] = (abs(df['close'] - df['recent_low']) / df['close'] < 0.005).astype(int)
-        df['near_swing_high'] = (abs(df['close'] - df['recent_high']) / df['close'] < 0.005).astype(int)
+        df['near_swing_low'] = (abs(df['close'] - df['recent_low']) / (df['close'] + 1e-10) < 0.005).astype(int)
+        df['near_swing_high'] = (abs(df['close'] - df['recent_high']) / (df['close'] + 1e-10) < 0.005).astype(int)
 
-        # Bars since swing low/high
-        df['bars_since_low'] = 0
-        df['bars_since_high'] = 0
+        # Bars since swing low/high (vectorized approach)
+        # Identify when we hit a new low/high
+        at_low = (df['low'] == df['recent_low']).astype(int)
+        at_high = (df['high'] == df['recent_high']).astype(int)
 
-        for i in range(1, len(df)):
-            if df['low'].iloc[i] == df['recent_low'].iloc[i]:
-                df.iloc[i, df.columns.get_loc('bars_since_low')] = 0
-            else:
-                df.iloc[i, df.columns.get_loc('bars_since_low')] = df.iloc[i-1, df.columns.get_loc('bars_since_low')] + 1
+        # Group by cumulative sum of hits to get periods between lows/highs
+        low_groups = at_low.cumsum()
+        high_groups = at_high.cumsum()
 
-            if df['high'].iloc[i] == df['recent_high'].iloc[i]:
-                df.iloc[i, df.columns.get_loc('bars_since_high')] = 0
-            else:
-                df.iloc[i, df.columns.get_loc('bars_since_high')] = df.iloc[i-1, df.columns.get_loc('bars_since_high')] + 1
+        # Count within each group
+        df['bars_since_low'] = df.groupby(low_groups).cumcount()
+        df['bars_since_high'] = df.groupby(high_groups).cumcount()
 
-        # Bounce from swing low (price moved up after touching low)
+        # Bounce from swing low (price moved up after touching low within last 5 bars)
         df['bouncing_from_low'] = ((df['bars_since_low'] < 5) & (df['close'] > df['recent_low'])).astype(int)
         df['rejecting_from_high'] = ((df['bars_since_high'] < 5) & (df['close'] < df['recent_high'])).astype(int)
 
