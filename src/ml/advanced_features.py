@@ -202,7 +202,14 @@ class AdvancedFeatureEngineer:
         htf[f'sma_20_{suffix}'] = ta.sma(htf['close'], length=20)
         htf[f'sma_50_{suffix}'] = ta.sma(htf['close'], length=50)
         htf[f'rsi_{suffix}'] = ta.rsi(htf['close'], length=14)
-        htf[f'trend_{suffix}'] = np.where(htf[f'sma_20_{suffix}'] > htf[f'sma_50_{suffix}'], 1, -1)
+
+        # Only calculate trend if we have valid SMA values
+        sma_20 = htf[f'sma_20_{suffix}']
+        sma_50 = htf[f'sma_50_{suffix}']
+        if sma_20 is not None and sma_50 is not None and not sma_20.isna().all() and not sma_50.isna().all():
+            htf[f'trend_{suffix}'] = np.where(sma_20 > sma_50, 1, -1)
+        else:
+            htf[f'trend_{suffix}'] = 0  # Neutral if insufficient data
 
         # ADX for higher TF
         adx = ta.adx(htf['high'], htf['low'], htf['close'], length=14)
