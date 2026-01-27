@@ -50,6 +50,12 @@ class AdvancedFeatureEngineer:
         # 5. Pattern quality features
         features = self._add_pattern_quality_features(features)
 
+        # 6. FRESH TREND DETECTION FEATURES
+        features = self._add_trend_age_features(features)
+        features = self._add_retracement_features(features)
+        features = self._add_momentum_shift_features(features)
+        features = self._add_swing_features(features)
+
         # Drop NaN
         features = features.dropna()
 
@@ -66,7 +72,7 @@ class AdvancedFeatureEngineer:
         # Trend indicators
         for period in [10, 20, 50, 100, 200]:
             df[f'sma_{period}'] = ta.sma(df['close'], length=period)
-            df[f'sma_{period}_slope'] = df[f'sma_{period}'].diff(5) / df[f'sma_{period}']
+            df[f'sma_{period}_slope'] = (df[f'sma_{period}'].diff(5) / df[f'sma_{period}']).fillna(0)
 
         for period in [9, 21, 50]:
             df[f'ema_{period}'] = ta.ema(df['close'], length=period)
@@ -258,5 +264,128 @@ class AdvancedFeatureEngineer:
 
         return df
 
+    def _add_trend_age_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add trend age and exhaustion detection features."""
+        # Track trend direction changes
+        if 'trend_direction' in df.columns:
+            # Count bars in current trend
+            trend_changes = (df['trend_direction'] != df['trend_direction'].shift(1)).astype(int)
+            trend_group = trend_changes.cumsum()
+            df['trend_bars_age'] = df.groupby(trend_group).cumcount()
+
+            # Trend exhaustion score (normalized age)
+            df['trend_exhaustion_score'] = np.tanh(df['trend_bars_age'] / 50)  # 0-1 scale
+
+            # Is trend fresh? (< 30 bars old)
+            df['is_fresh_trend'] = (df['trend_bars_age'] < 30).astype(int)
+
+        # Distance from key moving averages (measure extension)
+        if 'sma_50' in df.columns:
+            df['distance_from_sma50'] = (df['close'] - df['sma_50']) / df['sma_50']
+            df['is_extended_from_ma'] = (abs(df['distance_from_sma50']) > 0.02).astype(int)  # 2% threshold
+
+        return df
+
+    def _add_retracement_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add retracement and pullback detection features."""
+        # Calculate swing highs and lows (local extrema)
+        swing_period = 10
+        df['swing_high'] = df['high'].rolling(window=swing_period*2+1, center=True).max() == df['high']
+        df['swing_low'] = df['low'].rolling(window=swing_period*2+1, center=True).min() == df['low']
+
+        # Forward fill swing levels for comparison
+        df['last_swing_high'] = df.loc[df['swing_high'], 'high'].ffill()
+        df['last_swing_low'] = df.loc[df['swing_low'], 'low'].ffill()
+
+        # Retracement depth from recent high/low
+        if 'last_swing_high' in df.columns and 'last_swing_low' in df.columns:
+            swing_range = df['last_swing_high'] - df['last_swing_low']
+            df['retracement_from_high'] = (df['last_swing_high'] - df['close']) / (swing_range + 1e-10)
+            df['retracement_from_low'] = (df['close'] - df['last_swing_low']) / (swing_range + 1e-10)
+
+            # In retracement zone? (38.2% to 61.8% fibonacci)
+            df['in_buy_retracement'] = ((df['retracement_from_high'] > 0.382) &
+                                        (df['retracement_from_high'] < 0.618)).astype(int)
+            df['in_sell_retracement'] = ((df['retracement_from_low'] > 0.382) &
+                                         (df['retracement_from_low'] < 0.618)).astype(int)
+
+        # Pullback detection (price pulled back but trend intact)
+        if 'sma_20' in df.columns and 'sma_50' in df.columns:
+            uptrend = df['sma_20'] > df['sma_50']
+            downtrend = df['sma_20'] < df['sma_50']
+
+            # Pullback in uptrend = price below SMA20 but above SMA50
+            df['pullback_in_uptrend'] = (uptrend & (df['close'] < df['sma_20']) &
+                                         (df['close'] > df['sma_50'])).astype(int)
+            df['pullback_in_downtrend'] = (downtrend & (df['close'] > df['sma_20']) &
+                                           (df['close'] < df['sma_50'])).astype(int)
+
+        return df
+
+    def _add_momentum_shift_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add momentum shift detection for catching fresh trends."""
+        # Rate of change (ROC)
+        for period in [5, 10, 20]:
+            df[f'roc_{period}'] = df['close'].pct_change(period)
+
+        # Momentum acceleration (ROC of ROC)
+        df['momentum_acceleration'] = df['roc_10'].diff(5)
+
+        # Detect momentum shifts from negative to positive (fresh uptrend start)
+        df['momentum_shift_bullish'] = ((df['roc_5'] > 0) & (df['roc_5'].shift(1) <= 0) &
+                                        (df['momentum_acceleration'] > 0)).astype(int)
+        df['momentum_shift_bearish'] = ((df['roc_5'] < 0) & (df['roc_5'].shift(1) >= 0) &
+                                        (df['momentum_acceleration'] < 0)).astype(int)
+
+        # MACD momentum shift
+        if 'macd_hist' in df.columns:
+            df['macd_turning_bullish'] = ((df['macd_hist'] > 0) &
+                                          (df['macd_hist'].shift(1) <= 0)).astype(int)
+            df['macd_turning_bearish'] = ((df['macd_hist'] < 0) &
+                                          (df['macd_hist'].shift(1) >= 0)).astype(int)
+
+        # RSI momentum (catching divergences and shifts)
+        if 'rsi_14' in df.columns:
+            df['rsi_momentum'] = df['rsi_14'].diff(3)
+            df['rsi_turning_bullish'] = ((df['rsi_14'] > 50) & (df['rsi_14'].shift(3) < 50) &
+                                         (df['rsi_momentum'] > 0)).astype(int)
+            df['rsi_turning_bearish'] = ((df['rsi_14'] < 50) & (df['rsi_14'].shift(3) > 50) &
+                                         (df['rsi_momentum'] < 0)).astype(int)
+
+        return df
+
+    def _add_swing_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add swing point quality features for entry timing."""
+        # Identify quality swing lows (for buy entries)
+        lookback = 20
+        df['recent_low'] = df['low'].rolling(lookback).min()
+        df['recent_high'] = df['high'].rolling(lookback).max()
+
+        # Near swing low (within 0.5% of recent low)
+        df['near_swing_low'] = (abs(df['close'] - df['recent_low']) / df['close'] < 0.005).astype(int)
+        df['near_swing_high'] = (abs(df['close'] - df['recent_high']) / df['close'] < 0.005).astype(int)
+
+        # Bars since swing low/high
+        df['bars_since_low'] = 0
+        df['bars_since_high'] = 0
+
+        for i in range(1, len(df)):
+            if df['low'].iloc[i] == df['recent_low'].iloc[i]:
+                df.iloc[i, df.columns.get_loc('bars_since_low')] = 0
+            else:
+                df.iloc[i, df.columns.get_loc('bars_since_low')] = df.iloc[i-1, df.columns.get_loc('bars_since_low')] + 1
+
+            if df['high'].iloc[i] == df['recent_high'].iloc[i]:
+                df.iloc[i, df.columns.get_loc('bars_since_high')] = 0
+            else:
+                df.iloc[i, df.columns.get_loc('bars_since_high')] = df.iloc[i-1, df.columns.get_loc('bars_since_high')] + 1
+
+        # Bounce from swing low (price moved up after touching low)
+        df['bouncing_from_low'] = ((df['bars_since_low'] < 5) & (df['close'] > df['recent_low'])).astype(int)
+        df['rejecting_from_high'] = ((df['bars_since_high'] < 5) & (df['close'] < df['recent_high'])).astype(int)
+
+        return df
+
     def get_feature_names(self) -> List[str]:
         return self.feature_names
+

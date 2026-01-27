@@ -566,7 +566,72 @@ def cmd_trade(args):
                         print(f"  {symbol}: 📊 {corr_reason}")
                         continue
 
-                    # === FILTER 3: Regime Detection (simple heuristic) ===
+                    # === FILTER 3: FRESH TREND DETECTION ===
+                    # Get the latest feature values for freshness checks
+                    latest_features = features_df.iloc[-1]
+
+                    # Filter 3.1: Check trend age (avoid exhausted trends)
+                    if 'trend_bars_age' in latest_features.index:
+                        trend_age = latest_features['trend_bars_age']
+                        if trend_age > 100:  # Trend too old
+                            print(f"  {symbol}: {signal_type} signal SKIPPED (trend age: {trend_age:.0f} bars - exhausted)")
+                            continue
+
+                    # Filter 3.2: Require retracement for better entry
+                    if signal_type == 'BUY':
+                        # For BUY: prefer pullback in uptrend or bounce from support
+                        has_retracement = False
+                        if 'pullback_in_uptrend' in latest_features.index and latest_features['pullback_in_uptrend'] == 1:
+                            has_retracement = True
+                        elif 'in_buy_retracement' in latest_features.index and latest_features['in_buy_retracement'] == 1:
+                            has_retracement = True
+                        elif 'bouncing_from_low' in latest_features.index and latest_features['bouncing_from_low'] == 1:
+                            has_retracement = True
+
+                        if not has_retracement:
+                            print(f"  {symbol}: BUY signal SKIPPED (no retracement - price extended)")
+                            continue
+
+                    elif signal_type == 'SELL':
+                        # For SELL: prefer bounce in downtrend or rejection from resistance
+                        has_retracement = False
+                        if 'pullback_in_downtrend' in latest_features.index and latest_features['pullback_in_downtrend'] == 1:
+                            has_retracement = True
+                        elif 'in_sell_retracement' in latest_features.index and latest_features['in_sell_retracement'] == 1:
+                            has_retracement = True
+                        elif 'rejecting_from_high' in latest_features.index and latest_features['rejecting_from_high'] == 1:
+                            has_retracement = True
+
+                        if not has_retracement:
+                            print(f"  {symbol}: SELL signal SKIPPED (no retracement - price extended)")
+                            continue
+
+                    # Filter 3.3: Check for momentum shift (fresh moves preferred)
+                    has_momentum_shift = False
+                    if signal_type == 'BUY':
+                        if 'momentum_shift_bullish' in latest_features.index and latest_features['momentum_shift_bullish'] == 1:
+                            has_momentum_shift = True
+                        elif 'macd_turning_bullish' in latest_features.index and latest_features['macd_turning_bullish'] == 1:
+                            has_momentum_shift = True
+                        elif 'rsi_turning_bullish' in latest_features.index and latest_features['rsi_turning_bullish'] == 1:
+                            has_momentum_shift = True
+                    else:  # SELL
+                        if 'momentum_shift_bearish' in latest_features.index and latest_features['momentum_shift_bearish'] == 1:
+                            has_momentum_shift = True
+                        elif 'macd_turning_bearish' in latest_features.index and latest_features['macd_turning_bearish'] == 1:
+                            has_momentum_shift = True
+                        elif 'rsi_turning_bearish' in latest_features.index and latest_features['rsi_turning_bearish'] == 1:
+                            has_momentum_shift = True
+
+                    # Momentum shift is a bonus, not required, but we log it
+                    momentum_label = "✨ Fresh momentum" if has_momentum_shift else "⚠️ Continuation"
+
+                    # Filter 3.4: Avoid price too extended from MA
+                    if 'is_extended_from_ma' in latest_features.index and latest_features['is_extended_from_ma'] == 1:
+                        print(f"  {symbol}: {signal_type} signal SKIPPED (price >2% extended from SMA50)")
+                        continue
+
+                    # === FILTER 4: Regime Detection (simple heuristic) ===
                     atr_pips = calculate_atr_pips(df_h1)
                     volatility = df_h1['close'].pct_change().rolling(20).std().iloc[-1]
                     is_high_vol = volatility > 0.015
@@ -574,7 +639,7 @@ def cmd_trade(args):
                     if is_high_vol:
                         print(f"  {symbol}: ⚡ High volatility - reducing size")
 
-                    print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%} | ATR: {atr_pips:.1f} pips")
+                    print(f"  🔔 {symbol}: {signal_type} | Confidence: {confidence:.2%} | ATR: {atr_pips:.1f} pips | {momentum_label}")
 
                     # Save signal to MongoDB
                     db.save_signal({
