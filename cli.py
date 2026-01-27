@@ -438,25 +438,28 @@ def cmd_trade(args):
 
                             if not df_h1.empty:
                                 features_df = engineer.create_advanced_features(df_h1, df_h4, df_d1)
-                                market_features = features_df[engineer.get_feature_names()].tail(1).values
 
-                                # Position features
-                                max_profit = max(unrealized_pips, pos.profit * 10)  # Approximate
-                                position_features = np.array([[
-                                    bars_open,
-                                    unrealized_pips,
-                                    max_profit,
-                                    min(0, unrealized_pips),  # max drawdown
-                                    unrealized_pips - max_profit,  # pullback
-                                    bars_open / 48  # normalized time
-                                ]])
+                                # Check if we have valid features after dropna
+                                if not features_df.empty and len(features_df) > 0:
+                                    market_features = features_df[engineer.get_feature_names()].tail(1).values
 
-                                X_exit = np.hstack([market_features, position_features])
-                                exit_pred, exit_proba = exit_models[symbol].predict(X_exit)
+                                    # Position features
+                                    max_profit = max(unrealized_pips, pos.profit * 10)  # Approximate
+                                    position_features = np.array([[
+                                        bars_open,
+                                        unrealized_pips,
+                                        max_profit,
+                                        min(0, unrealized_pips),  # max drawdown
+                                        unrealized_pips - max_profit,  # pullback
+                                        bars_open / 48  # normalized time
+                                    ]])
 
-                                if exit_pred[0] == 1 and exit_proba[0] > EXIT_CONFIDENCE:
-                                    should_close = True
-                                    close_reason = f"ML Exit ({exit_proba[0]:.0%})"
+                                    X_exit = np.hstack([market_features, position_features])
+                                    exit_pred, exit_proba = exit_models[symbol].predict(X_exit)
+
+                                    if exit_pred[0] == 1 and exit_proba[0] > EXIT_CONFIDENCE:
+                                        should_close = True
+                                        close_reason = f"ML Exit ({exit_proba[0]:.0%})"
 
                         # Fallback: Force close after max hold hours
                         if not should_close and hours_open >= MAX_HOLD_HOURS:

@@ -223,7 +223,7 @@ class AdvancedFeatureEngineer:
 
         htf_subset = htf[existing_cols]
         df = df.join(htf_subset, how='left')
-        df[existing_cols] = df[existing_cols].ffill()
+        df[existing_cols] = df[existing_cols].ffill().infer_objects(copy=False)
 
         # Alignment feature - does H1 trend match H4/D1 trend?
         if f'trend_{suffix}' in df.columns and 'ema_9_21_cross' in df.columns:
